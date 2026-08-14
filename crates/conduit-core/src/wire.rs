@@ -67,7 +67,80 @@ pub enum ControlMessage {
     Bye {
         reason: ByeReason,
     },
+    /// Virtual-mount operation (`docs/PROTOCOL.md` §4). The first control message
+    /// after `Hello` classifies the session: `Offer` opens a transfer session,
+    /// `FsRequest` opens a filesystem session that serves many requests.
+    FsRequest {
+        /// Correlates the response (and any data stream) with this request.
+        request_id: u64,
+        op: FsOp,
+    },
+    FsResponse {
+        request_id: u64,
+        result: FsResult,
+    },
 }
+
+/// Filesystem operations against the peer's shared area. Paths are share-relative,
+/// `/`-separated, and never absolute; `""` names the share root itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FsOp {
+    ListDir { path: String },
+    Stat { path: String },
+    /// Read `len` bytes at `offset`. The payload answers on a unidirectional
+    /// stream (see [`FsDataHeader`]), not inside the control response.
+    ReadRange { path: String, offset: u64, len: u32 },
+    Mkdir { path: String },
+    /// Remove a file (not a directory) — v1 keeps deletion conservative.
+    Unlink { path: String },
+    Rename { from: String, to: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FsResult {
+    DirListing { entries: Vec<FsDirEntry> },
+    Attr(FsAttr),
+    /// `len` bytes (possibly short at EOF) follow on a unidirectional stream
+    /// framed by [`FsDataHeader`] with the same `request_id`.
+    ReadStarted { len: u32 },
+    /// A mutation (mkdir/unlink/rename) succeeded.
+    Done,
+    Error { message: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FsEntryKind {
+    File,
+    Dir,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FsDirEntry {
+    pub name: String,
+    pub kind: FsEntryKind,
+    pub size: u64,
+    /// Seconds since the Unix epoch; 0 when the filesystem does not say.
+    pub modified_unix: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FsAttr {
+    pub kind: FsEntryKind,
+    pub size: u64,
+    pub modified_unix: u64,
+}
+
+/// Header preceding a `ReadRange` payload on its unidirectional stream; the `len`
+/// raw bytes follow on the same stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FsDataHeader {
+    pub request_id: u64,
+    pub len: u32,
+}
+
+/// Upper bound on one `ReadRange` request. Mount backends issue reads in pieces no
+/// larger than this; the server rejects anything bigger.
+pub const MAX_FS_READ_BYTES: u32 = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AckResult {

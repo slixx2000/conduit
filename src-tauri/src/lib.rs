@@ -25,8 +25,8 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::{mpsc, oneshot, Mutex};
 
 use conduit_core::{
-    ByeReason, ConduitEndpoint, DeviceId, DeviceIdentity, PeerSession, ReceiveOptions,
-    SendOptions, TransferEvent, TransferId, TrustStatus, TrustStore,
+    ByeReason, ConduitEndpoint, DeviceId, DeviceIdentity, FsClient, PeerSession, ReceiveOptions,
+    SendOptions, Served, TransferEvent, TransferId, TrustStatus, TrustStore,
 };
 use conduit_discovery::{Discovery, Peer, PeerEvent};
 
@@ -78,6 +78,8 @@ struct AppState {
     active: Arc<Mutex<HashMap<TransferId, tokio::task::AbortHandle>>>,
     /// Keeps the mDNS advertisement alive for the app's lifetime.
     _discovery: Discovery,
+    /// Live mounts of peers as local drives, keyed by peer.
+    mounts: Arc<Mutex<HashMap<DeviceId, ActiveMount>>>,
     /// The pluggable link layer (`docs/Transports.md`).
     transports: conduit_net::TransportManager,
     /// User-pinned interface name; `None` = auto-select the fastest link.
@@ -176,6 +178,12 @@ fn node_status(state: State<'_, AppState>) -> NodeStatus {
     }
 }
 
+/// A peer mounted as a local drive.
+struct ActiveMount {
+    handle: conduit_fs::MountHandle,
+    client: FsClient,
+}
+
 /// One row of the UI's peer list.
 #[derive(Debug, Serialize, Clone)]
 struct PeerRow {
@@ -186,11 +194,14 @@ struct PeerRow {
     trusted: bool,
     /// Speaks our protocol major; incompatible peers render greyed out.
     compatible: bool,
+    /// Where this peer is currently mounted as a drive, if it is.
+    mounted: Option<String>,
 }
 
 async fn peer_rows(state: &AppState) -> Vec<PeerRow> {
     let trust = state.trust.lock().await;
     let peers = state.peers.lock().await;
+    let mounts = state.mounts.lock().await;
     let mut rows: Vec<PeerRow> = peers
         .values()
         .map(|p| PeerRow {
@@ -199,10 +210,127 @@ async fn peer_rows(state: &AppState) -> Vec<PeerRow> {
             addr: p.socket_addr().to_string(),
             trusted: trust.peers().any(|(id, _)| *id == p.id),
             compatible: p.is_compatible(),
+            mounted: mounts.get(&p.id).map(|m| m.handle.mountpoint().to_string()),
         })
         .collect();
     rows.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
     rows
+}
+
+/// First drive letter with nothing behind it, scanning backwards from Z:.
+fn free_drive_letter() -> Option<String> {
+    ('D'..='Z')
+        .rev()
+        .map(|c| format!("{c}:"))
+        .find(|d| !std::path::Path::new(&format!("{d}\\")).exists())
+}
+
+/// Mount `peer_id`'s shared folder as a local drive. Returns the mount point.
+#[tauri::command]
+async fn mount_peer(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    peer_id: String,
+) -> Result<String, String> {
+    let id = DeviceId(peer_id.parse::<uuid::Uuid>().map_err(|_| "bad peer id")?);
+    if let Some(existing) = state.mounts.lock().await.get(&id) {
+        return Ok(existing.handle.mountpoint().to_string());
+    }
+    let peer = state
+        .peers
+        .lock()
+        .await
+        .get(&id)
+        .cloned()
+        .ok_or("that peer is no longer visible on the network")?;
+    let mountpoint = free_drive_letter().ok_or("no free drive letter")?;
+
+    let session = state
+        .endpoint
+        .connect_any(&peer.socket_addrs())
+        .await
+        .map_err(|e| e.to_string())?;
+    let session = pair_with_ui(&app, session, "outgoing")
+        .await
+        .map_err(|e| e.to_string())?;
+    let client = FsClient::start(session).map_err(|e| e.to_string())?;
+
+    // Files written into the mount ship to the peer as ordinary transfers, with
+    // progress in the UI like any other outgoing send.
+    let on_write: conduit_fs::WriteHandler = {
+        let app = app.clone();
+        let peer_id = peer_id.clone();
+        let rt = tokio::runtime::Handle::current();
+        Arc::new(move |name, spool| {
+            let app = app.clone();
+            let peer_id = peer_id.clone();
+            rt.spawn(async move {
+                let state = app.state::<AppState>();
+                let result: Result<(), String> = async {
+                    let candidates = resolve_target(&state, &peer_id).await?;
+                    let session = state
+                        .endpoint
+                        .connect_any(&candidates)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    let session = pair_with_ui(&app, session, "outgoing")
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    let events = forward_events(app.clone(), "outgoing", None);
+                    conduit_core::send_path(session, &spool, SendOptions::default(), events)
+                        .await
+                        .map_err(|e| e.to_string())
+                }
+                .await;
+                if let Err(e) = result {
+                    emit_error(&app, format!("writing {name} to the peer failed: {e}"));
+                }
+                let _ = std::fs::remove_file(&spool);
+                if let Some(parent) = spool.parent() {
+                    let _ = std::fs::remove_dir(parent);
+                }
+            });
+        })
+    };
+
+    let handle = conduit_fs::mount(
+        client.clone(),
+        tokio::runtime::Handle::current(),
+        &mountpoint,
+        conduit_fs::MountOptions {
+            volume_label: peer.name.clone(),
+        },
+        on_write,
+    )
+    .map_err(|e| e.to_string())?;
+
+    state
+        .mounts
+        .lock()
+        .await
+        .insert(id, ActiveMount { handle, client });
+    let _ = app.emit("conduit://peers", peer_rows(&state).await);
+    Ok(mountpoint)
+}
+
+/// Remove a peer's drive.
+#[tauri::command]
+async fn unmount_peer(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    peer_id: String,
+) -> Result<(), String> {
+    let id = DeviceId(peer_id.parse::<uuid::Uuid>().map_err(|_| "bad peer id")?);
+    if let Some(mount) = state.mounts.lock().await.remove(&id) {
+        // Unmount blocks on the host thread joining; keep the async runtime free.
+        let _ = tokio::task::spawn_blocking(move || {
+            mount.handle.unmount();
+            mount.client.close();
+        })
+        .await;
+    }
+    let _ = app.emit("conduit://peers", peer_rows(&state).await);
+    Ok(())
 }
 
 /// Snapshot for initial render; afterwards "conduit://peers" pushes updates.
@@ -477,19 +605,24 @@ async fn accept_loop(app: AppHandle) {
                     let task = tokio::spawn({
                         let app = app.clone();
                         async move {
-                            if let Err(e) = conduit_core::receive_one(
+                            // The inbox doubles as this device's shared folder: it
+                            // receives transfers and backs peers' mounts of us.
+                            match conduit_core::serve_session(
                                 session,
-                                ReceiveOptions { dest_dir: inbox },
+                                ReceiveOptions {
+                                    dest_dir: inbox.clone(),
+                                },
+                                inbox,
                                 events,
                             )
                             .await
                             {
+                                Ok(Served::Transfer(_)) | Ok(Served::FsSession) => {}
                                 // Connection loss is routine (sender will redial and
                                 // resume); anything else deserves a visible error on
                                 // top of the transfer's own Failed event.
-                                if !matches!(e, conduit_core::Error::Connection(_)) {
-                                    emit_error(&app, e.to_string());
-                                }
+                                Err(conduit_core::Error::Connection(_)) => {}
+                                Err(e) => emit_error(&app, e.to_string()),
                             }
                         }
                     });
@@ -549,6 +682,7 @@ pub fn run() {
                 pending_pairing: Arc::new(Mutex::new(None)),
                 peers: Arc::new(Mutex::new(HashMap::new())),
                 active: Arc::new(Mutex::new(HashMap::new())),
+                mounts: Arc::new(Mutex::new(HashMap::new())),
                 _discovery: discovery,
                 transports: conduit_net::TransportManager::with_defaults(),
                 link_override: Arc::new(Mutex::new(None)),
@@ -590,6 +724,8 @@ pub fn run() {
             peers_snapshot,
             send_to_peer,
             cancel_transfer,
+            mount_peer,
+            unmount_peer,
             confirm_pairing
         ])
         .run(tauri::generate_context!())

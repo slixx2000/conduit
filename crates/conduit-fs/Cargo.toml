@@ -1,15 +1,24 @@
 [package]
 name = "conduit-fs"
-description = "Virtual mounted volume backed by a Conduit peer (Phase 4)."
+description = "Virtual mounted volume: the peer's shared area as a drive (WinFsp on Windows; FUSE ports pending)."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+build = "build.rs"
 
 [dependencies]
 conduit-core.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 tracing.workspace = true
 
-# Phase 4 adds the platform backends here:
-#   [target.'cfg(unix)'.dependencies]  fuser = "0.14"
-#   [target.'cfg(windows)'.dependencies]  winfsp = "0.2"
+[target.'cfg(windows)'.dependencies]
+# `system` resolves the installed winfsp DLL via the registry at runtime — without
+# it only a DLL beside the exe would load.
+winfsp = { version = "0.13.0", features = ["system"] }
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
+[target.'cfg(windows)'.build-dependencies]
+# Emits the /DELAYLOAD linker flags so the binary starts even without WinFsp
+# installed (mount() then reports DriverMissing instead of failing to launch).
+winfsp = { version = "0.13.0", features = ["build"] }

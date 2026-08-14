@@ -9,8 +9,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use conduit_core::{
-    receive_one, send_path, ConduitEndpoint, DeviceIdentity, ReceiveOptions, SendOptions,
-    TransferEvent, TrustStatus, TrustStore,
+    receive_one, send_path, serve_session, ConduitEndpoint, DeviceIdentity, FsClient,
+    FsEntryKind, ReceiveOptions, SendOptions, Served, TransferEvent, TrustStatus, TrustStore,
 };
 use rand::RngCore;
 use tokio::sync::mpsc;
@@ -354,6 +354,133 @@ async fn interrupted_transfer_resumes_without_resending_completed_chunks() {
         .filter(|e| e.file_name().to_string_lossy().starts_with(".conduit-"))
         .collect();
     assert!(leftovers.is_empty(), "staging must be cleaned up after success");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fs_session_serves_listings_reads_and_mutations() {
+    let share = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(share.path().join("docs")).unwrap();
+    let mut blob = vec![0u8; 3_000_000];
+    rand::thread_rng().fill_bytes(&mut blob);
+    std::fs::write(share.path().join("blob.bin"), &blob).unwrap();
+    std::fs::write(share.path().join("docs/readme.txt"), b"hello mount").unwrap();
+    // Plumbing that must stay invisible to the peer.
+    std::fs::create_dir_all(share.path().join(".conduit-abc.part")).unwrap();
+
+    let alice = make_peer("Alice");
+    let bob = make_peer("Bob");
+    let bob_addr = bob.endpoint.local_addr().unwrap();
+    let share_root = share.path().to_owned();
+
+    let server = tokio::spawn(async move {
+        let session = bob.endpoint.accept().await.unwrap().unwrap();
+        let (tx, _rx) = mpsc::channel(16);
+        serve_session(
+            session,
+            ReceiveOptions {
+                dest_dir: std::env::temp_dir(),
+            },
+            share_root,
+            tx,
+        )
+        .await
+    });
+
+    let session = alice.endpoint.connect(bob_addr).await.unwrap();
+    let fs = FsClient::start(session).unwrap();
+
+    // Listing: sorted, staging dir hidden.
+    let root = fs.list_dir("").await.unwrap();
+    let names: Vec<(&str, FsEntryKind)> =
+        root.iter().map(|e| (e.name.as_str(), e.kind)).collect();
+    assert_eq!(
+        names,
+        vec![("blob.bin", FsEntryKind::File), ("docs", FsEntryKind::Dir)]
+    );
+    assert_eq!(root[0].size, blob.len() as u64);
+
+    // Stat.
+    let attr = fs.stat("docs/readme.txt").await.unwrap();
+    assert_eq!(attr.kind, FsEntryKind::File);
+    assert_eq!(attr.size, 11);
+    assert!(attr.modified_unix > 0);
+
+    // Ranged reads: middle window, then a short read past EOF.
+    let window = fs.read_range("blob.bin", 1_000_000, 65_536).await.unwrap();
+    assert_eq!(window, &blob[1_000_000..1_065_536]);
+    let tail = fs.read_range("blob.bin", blob.len() as u64 - 10, 4096).await.unwrap();
+    assert_eq!(tail, &blob[blob.len() - 10..]);
+    let full = fs.read_range("docs/readme.txt", 0, 4096).await.unwrap();
+    assert_eq!(full, b"hello mount");
+
+    // Concurrent reads keep their request/payload correlation straight.
+    let (a, b, c) = tokio::join!(
+        fs.read_range("blob.bin", 0, 100_000),
+        fs.read_range("blob.bin", 2_000_000, 100_000),
+        fs.read_range("docs/readme.txt", 6, 100),
+    );
+    assert_eq!(a.unwrap(), &blob[..100_000]);
+    assert_eq!(b.unwrap(), &blob[2_000_000..2_100_000]);
+    assert_eq!(c.unwrap(), b"mount");
+
+    // Mutations act on the real share.
+    fs.mkdir("docs/new").await.unwrap();
+    assert!(share.path().join("docs/new").is_dir());
+    fs.rename("docs/readme.txt", "docs/new/readme.txt").await.unwrap();
+    assert!(share.path().join("docs/new/readme.txt").is_file());
+    fs.unlink("docs/new/readme.txt").await.unwrap();
+    assert!(!share.path().join("docs/new/readme.txt").exists());
+
+    // Failures are per-op, not per-session.
+    assert!(fs.stat("no-such-file").await.is_err());
+    assert!(fs.read_range("../escape", 0, 16).await.is_err());
+    assert!(fs.unlink("docs").await.is_err(), "unlink refuses directories");
+    let survives = fs.list_dir("docs").await.unwrap();
+    assert_eq!(survives.len(), 1, "session must survive failed ops");
+
+    // Unmount: the serving side ends cleanly.
+    fs.close();
+    let served = tokio::time::timeout(std::time::Duration::from_secs(10), server)
+        .await
+        .expect("server must end after unmount")
+        .unwrap()
+        .expect("fs session must end cleanly");
+    assert!(matches!(served, Served::FsSession));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn serve_session_still_dispatches_transfers() {
+    let src_dir = tempfile::tempdir().unwrap();
+    let dest_dir = tempfile::tempdir().unwrap();
+    let source = random_file(src_dir.path(), 512 * 1024);
+
+    let alice = make_peer("Alice");
+    let bob = make_peer("Bob");
+    let bob_addr = bob.endpoint.local_addr().unwrap();
+    let dest = dest_dir.path().to_owned();
+
+    let server = tokio::spawn(async move {
+        let session = bob.endpoint.accept().await.unwrap().unwrap();
+        let (tx, _rx) = mpsc::channel(1024);
+        serve_session(
+            session,
+            ReceiveOptions { dest_dir: dest },
+            std::env::temp_dir(),
+            tx,
+        )
+        .await
+    });
+
+    let session = alice.endpoint.connect(bob_addr).await.unwrap();
+    let (tx, _rx) = mpsc::channel(1024);
+    send_path(session, &source, SendOptions::default(), tx)
+        .await
+        .unwrap();
+
+    match server.await.unwrap().unwrap() {
+        Served::Transfer(path) => assert_eq!(blake3_of(&source), blake3_of(&path)),
+        other => panic!("expected a transfer, got {other:?}"),
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

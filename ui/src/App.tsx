@@ -19,6 +19,7 @@ type PeerRow = {
   addr: string;
   trusted: boolean;
   compatible: boolean;
+  mounted: string | null;
 };
 
 /** Mirrors `LinkRow` / `LinkStatus` in `src-tauri/src/lib.rs`. */
@@ -240,6 +241,24 @@ export default function App() {
     invoke("cancel_transfer", { transferId: id }).catch(() => {});
   }
 
+  const [mountBusy, setMountBusy] = useState<string | null>(null);
+
+  async function toggleMount(p: PeerRow) {
+    setLastError(null);
+    setMountBusy(p.id);
+    try {
+      if (p.mounted) {
+        await invoke("unmount_peer", { peerId: p.id });
+      } else {
+        await invoke("mount_peer", { peerId: p.id });
+      }
+    } catch (e) {
+      setLastError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setMountBusy(null);
+    }
+  }
+
   function setOverride(iface: string | null) {
     invoke("set_link_override", { iface })
       .then(() => invoke<LinkStatus>("link_status").then(setLink).catch(() => {}))
@@ -340,6 +359,17 @@ export default function App() {
                       className="rounded-md bg-white/10 px-3 py-1.5 text-xs text-slate-200"
                     >
                       Send folder
+                    </button>
+                    <button
+                      onClick={() => toggleMount(p)}
+                      disabled={mountBusy === p.id}
+                      className="rounded-md bg-white/10 px-3 py-1.5 text-xs text-slate-200 disabled:opacity-40"
+                    >
+                      {mountBusy === p.id
+                        ? "…"
+                        : p.mounted
+                          ? `Unmount ${p.mounted}`
+                          : "Mount as drive"}
                     </button>
                     <span className="ml-auto self-center text-[11px] text-slate-500">
                       or drop files here

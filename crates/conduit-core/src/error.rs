@@ -76,6 +76,11 @@ pub enum Error {
     #[error("protocol violation: {0}")]
     Protocol(String),
 
+    /// A virtual-mount filesystem operation failed on the serving side (missing
+    /// file, permission, …). The session stays healthy; only the op failed.
+    #[error("filesystem operation failed: {0}")]
+    Fs(String),
+
     /// Placeholder for surface that is scaffolded but not yet built. Carries the
     /// roadmap phase so the message is actionable rather than mysterious.
     #[error("{what} is not implemented yet (planned for {phase})")]

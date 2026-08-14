@@ -5,6 +5,4 @@ fn main() {
     // links conduit-fs needs this.
     #[cfg(windows)]
     winfsp::build::winfsp_link_delayload();
-
-    tauri_build::build()
 }

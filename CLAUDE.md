@@ -20,9 +20,23 @@ normative), and `docs/ROADMAP.md` (phase order + acceptance criteria).
 
 ## Current state of the repo
 
-**Phases 0–3 are done (2 code-complete pending cable hardware; one Phase 3 bullet deferred, see
-below). Phase 4 (virtual mounted volume) is the next work.** The workspace builds, tests, and lints
-clean.
+**Phases 0–4 are done on Windows (Phase 2 code-complete pending cable hardware; Phase 4's
+FUSE/macFUSE ports pending a machine to validate on). Phase 5 (polish & release) is the next
+work.** The workspace builds, tests, and lints clean.
+
+Phase 4: `PROTOCOL.md` §4 is implemented — sessions classify on their first control message
+(`Offer` = transfer, `FsRequest` = filesystem), `conduit-core::fsops` provides the serving side
+(share root = the inbox) and the `FsClient` used by mounts, with `ReadRange` payloads on uni
+streams. `conduit-fs` mounts a peer via **WinFsp** (winfsp-rs): streamed reads, spool-on-write
+shipping via the ordinary transfer engine on handle close (cleanup, not close — the kernel defers
+close), brief stat caching, wildcard-filtered directory queries. Verified live on this machine:
+`conduit mount X: --peer <name>` shows the peer's share in Explorer, a 100 MB read off the drive is
+hash-identical (~180 MB/s loopback), a file copied onto the drive lands on the peer intact, mkdir/
+rename/delete work through the drive, and killing/unmounting removes it cleanly. **Windows build
+prerequisites**: WinFsp installed with its *Developer* feature (`winget install WinFsp.WinFsp
+--override "/qn ADDLOCAL=ALL"`) and LLVM for libclang (`LIBCLANG_PATH`) — winfsp-sys generates
+bindings against the installed SDK. Every crate that produces a Windows *binary* linking
+`conduit-fs` needs the delayload build script (see `crates/conduit-cli/build.rs`).
 
 The pipeline: QUIC/TLS 1.3 (`quinn` + `rustls`/ring) with persistent self-signed device certs,
 TLS-exporter-derived 6-digit pairing with TOFU fingerprint pinning, manifests for files **and

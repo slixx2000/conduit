@@ -12,6 +12,7 @@
 
 pub mod chunk;
 pub mod error;
+pub mod fsops;
 pub mod identity;
 pub mod manifest;
 pub mod protocol;
@@ -24,8 +25,10 @@ pub use error::{Error, Result};
 pub use identity::{DeviceIdentity, Fingerprint, TrustStatus, TrustStore, TrustedPeer};
 pub use manifest::{manifest_for_path, Entry, EntryKind, Manifest, TransferId};
 pub use protocol::{Capabilities, DeviceId, Hello, PROTOCOL_VERSION};
+pub use fsops::FsClient;
 pub use transfer::{
-    receive_one, send_path, ReceiveOptions, SendOptions, TransferEvent, DEFAULT_STREAM_COUNT,
+    receive_one, send_path, serve_session, ReceiveOptions, SendOptions, Served, TransferEvent,
+    DEFAULT_STREAM_COUNT,
 };
 pub use transport::{ConduitEndpoint, PeerInfo, PeerSession, Side};
-pub use wire::{ByeReason, ALPN};
+pub use wire::{ByeReason, FsAttr, FsDirEntry, FsEntryKind, ALPN, MAX_FS_READ_BYTES};

@@ -18,3 +18,6 @@ conduit-net.workspace = true
 clap = { version = "4", features = ["derive"] }
 dirs.workspace = true
 tokio.workspace = true
+
+[target.'cfg(windows)'.build-dependencies]
+winfsp = { version = "0.13.0", features = ["build"] }

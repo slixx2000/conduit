@@ -16,8 +16,8 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use conduit_core::{
-    receive_one, send_path, ByeReason, ConduitEndpoint, DeviceIdentity, PeerSession,
-    ReceiveOptions, SendOptions, TransferEvent, TrustStatus, TrustStore,
+    send_path, serve_session, ByeReason, ConduitEndpoint, DeviceIdentity, FsClient, PeerSession,
+    ReceiveOptions, SendOptions, Served, TransferEvent, TrustStatus, TrustStore,
 };
 use tokio::sync::mpsc;
 
@@ -72,6 +72,20 @@ enum Command {
         /// Chunk size in MiB.
         #[arg(long, default_value_t = 4)]
         chunk_mib: u32,
+        #[command(flatten)]
+        common: CommonOpts,
+    },
+    /// Mount a peer's shared folder as a drive (e.g. `conduit mount X: --peer name`).
+    /// The peer runs `conduit receive --forever`; its --dest directory is the share.
+    Mount {
+        /// Mount point — a free drive letter like `X:` on Windows.
+        mountpoint: String,
+        /// Peer address. Optional when --peer finds the target via mDNS.
+        #[arg(long, conflicts_with = "peer")]
+        to: Option<SocketAddr>,
+        /// Discover the peer by (a substring of) its advertised name.
+        #[arg(long)]
+        peer: Option<String>,
         #[command(flatten)]
         common: CommonOpts,
     },
@@ -156,6 +170,13 @@ async fn main() -> ExitCode {
             common,
         } => run(send(file, to, peer, streams, chunk_mib, common)).await,
 
+        Command::Mount {
+            mountpoint,
+            to,
+            peer,
+            common,
+        } => run(mount_cmd(mountpoint, to, peer, common)).await,
+
         Command::Peers { watch, common } => run(peers(watch, common)).await,
 
         Command::Bench {
@@ -184,7 +205,8 @@ async fn receive(
     forever: bool,
     common: CommonOpts,
 ) -> conduit_core::Result<()> {
-    let (endpoint, mut store) = open_endpoint(&common, listen)?;
+    let (endpoint, store) = open_endpoint(&common, listen)?;
+    let store = Arc::new(tokio::sync::Mutex::new(store));
     let local = endpoint.local_addr()?;
     println!(
         "listening on {local} — `conduit send <file> --peer <name>` (or --to <this address>) on the peer",
@@ -205,24 +227,132 @@ async fn receive(
             session.remote_address()
         );
 
-        let session = pair(session, &mut store, common.trust).await?;
+        let session = {
+            let mut guard = store.lock().await;
+            pair(session, &mut guard, common.trust).await?
+        };
 
-        let (events_tx, events_rx) = mpsc::channel(256);
-        let printer = tokio::spawn(print_events(events_rx));
-        let result = receive_one(session, ReceiveOptions { dest_dir: dest.clone() }, events_tx).await;
-        let _ = printer.await;
+        // Sessions are served concurrently: a peer holding a mount open must not
+        // block an incoming transfer (e.g. a write-back from that same mount).
+        // --dest is both the drop target and the shared folder.
+        let dest = dest.clone();
+        let task = tokio::spawn(async move {
+            let (events_tx, events_rx) = mpsc::channel(256);
+            let printer = tokio::spawn(print_events(events_rx));
+            let result = serve_session(
+                session,
+                ReceiveOptions {
+                    dest_dir: dest.clone(),
+                },
+                dest,
+                events_tx,
+            )
+            .await;
+            let _ = printer.await;
+            match result {
+                Ok(Served::Transfer(path)) => println!("received: {}", path.display()),
+                Ok(Served::FsSession) => println!("peer unmounted"),
+                Err(e) => eprintln!("session failed: {e}"),
+            }
+        });
 
-        match result {
-            Ok(path) => println!("received: {}", path.display()),
-            // In forever mode a failed transfer (peer vanished, hash mismatch) must
-            // not take the listener down with it.
-            Err(e) if forever => eprintln!("transfer failed: {e}"),
-            Err(e) => return Err(e),
-        }
         if !forever {
+            let _ = task.await;
             return Ok(());
         }
     }
+}
+
+/// Mount a peer's shared folder as a local drive; runs until Ctrl+C.
+async fn mount_cmd(
+    mountpoint: String,
+    to: Option<SocketAddr>,
+    peer: Option<String>,
+    common: CommonOpts,
+) -> conduit_core::Result<()> {
+    let (endpoint, store) = open_endpoint(&common, "0.0.0.0:0".parse().unwrap())?;
+    let endpoint = Arc::new(endpoint);
+    let store = Arc::new(tokio::sync::Mutex::new(store));
+
+    let candidates = match (to, peer) {
+        (Some(addr), _) => vec![addr],
+        (None, Some(needle)) => find_peer(&common, &needle).await?,
+        (None, None) => {
+            return Err(conduit_core::Error::Protocol(
+                "pass --peer <name> or --to <ip:port>".into(),
+            ))
+        }
+    };
+
+    let session = endpoint.connect_any(&candidates).await?;
+    let peer_name = session.peer.name.clone();
+    let session = {
+        let mut guard = store.lock().await;
+        pair(session, &mut guard, common.trust).await?
+    };
+    let client = FsClient::start(session)?;
+
+    // A file written into the mount spools locally; ship it to the peer with the
+    // ordinary transfer engine on a fresh connection (the mount session stays
+    // dedicated to filesystem traffic).
+    let on_write: conduit_fs::WriteHandler = {
+        let endpoint = Arc::clone(&endpoint);
+        let store = Arc::clone(&store);
+        let candidates = candidates.clone();
+        let trust = common.trust;
+        let peer_name = peer_name.clone();
+        let rt = tokio::runtime::Handle::current();
+        Arc::new(move |name, spool| {
+            let endpoint = Arc::clone(&endpoint);
+            let store = Arc::clone(&store);
+            let candidates = candidates.clone();
+            let peer_name = peer_name.clone();
+            rt.spawn(async move {
+                let result: conduit_core::Result<()> = async {
+                    let session = endpoint.connect_any(&candidates).await?;
+                    let session = {
+                        let mut guard = store.lock().await;
+                        pair(session, &mut guard, trust).await?
+                    };
+                    let (tx, mut rx) = mpsc::channel::<TransferEvent>(64);
+                    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+                    let result = send_path(session, &spool, SendOptions::default(), tx).await;
+                    let _ = drain.await;
+                    result
+                }
+                .await;
+                match result {
+                    Ok(()) => println!("wrote {name} to {peer_name}"),
+                    Err(e) => eprintln!("writing {name} to {peer_name} failed: {e}"),
+                }
+                let _ = std::fs::remove_file(&spool);
+                if let Some(parent) = spool.parent() {
+                    let _ = std::fs::remove_dir(parent);
+                }
+            });
+        })
+    };
+
+    let mount = conduit_fs::mount(
+        client.clone(),
+        tokio::runtime::Handle::current(),
+        &mountpoint,
+        conduit_fs::MountOptions {
+            volume_label: peer_name.clone(),
+        },
+        on_write,
+    )
+    .map_err(|e| conduit_core::Error::Protocol(e.to_string()))?;
+
+    println!(
+        "mounted {peer_name} at {} — press Ctrl+C to unmount",
+        mount.mountpoint()
+    );
+    let _ = tokio::signal::ctrl_c().await;
+    println!("unmounting …");
+    mount.unmount();
+    client.close();
+    Ok(())
 }
 
 async fn send(

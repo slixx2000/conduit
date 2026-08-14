@@ -38,6 +38,15 @@ jobs:
             libssl-dev \
             patchelf
 
+      # conduit-fs generates WinFsp bindings against the installed SDK (Developer
+      # feature) and needs libclang; the runner image ships LLVM.
+      - name: Install WinFsp SDK (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install winfsp -y --install-arguments="ADDLOCAL=ALL"
+          "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -Append $env:GITHUB_ENV
+
       - uses: actions/setup-node@v4
         with:
           node-version: 22

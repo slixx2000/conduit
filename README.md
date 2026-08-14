@@ -15,6 +15,13 @@ localhost or LAN with no Thunderbolt hardware.
 
 ## Status
 
+**Phase 4 (virtual mounted volume) — complete on Windows.** A paired peer mounts as a
+real drive (`conduit mount X: --peer <name>`, or "Mount as drive" in the app): its
+shared folder appears in Explorer, reads stream over the link on demand, and files
+copied onto the drive transfer to the peer through the ordinary verified pipeline.
+FUSE (Linux) and macFUSE ports are pending hardware to validate on. Requires the
+[WinFsp](https://winfsp.dev) driver at runtime.
+
 **Phase 3 (discovery + drop-folder UX) — complete.** Peers find each other over mDNS —
 no IP entry — and pair once with a 6-digit code (TOFU cert pinning). Files **and folder
 trees** transfer over QUIC/TLS 1.3 with parallel streams, live progress, per-chunk +
@@ -48,6 +55,11 @@ criteria.
 Prerequisites: Rust (stable, MSVC toolchain on Windows), Node 20+, and the platform
 webview dependencies — WebView2 (ships with Windows 11 and current Edge), or
 `libwebkit2gtk-4.1-dev` and friends on Linux (see `.github/workflows/ci.yml`).
+Building on Windows additionally needs **WinFsp with its Developer feature**
+(`winget install WinFsp.WinFsp --override "/qn ADDLOCAL=ALL"`) and **LLVM** for
+libclang (`winget install LLVM.LLVM`, then set `LIBCLANG_PATH` to
+`C:\Program Files\LLVM\bin`) — the WinFsp bindings are generated against the
+installed SDK.
 
 Everything runs from the repo root — the Tauri CLI locates `src-tauri/tauri.conf.json`
 by searching subfolders of the working directory, so `package.json` lives at the root
@@ -82,6 +94,10 @@ cargo run -p conduit-cli -- hash <file>
 cargo run --release -p conduit-cli -- receive --dest recv --identity-dir idA
 cargo run --release -p conduit-cli -- send <file-or-folder> --peer <name> --identity-dir idB
 cargo run --release -p conduit-cli -- peers            # who is visible right now?
+
+# Mount a peer's shared folder as a drive (peer runs `receive --forever`;
+# its --dest directory is the share). Ctrl+C unmounts.
+cargo run --release -p conduit-cli -- mount X: --peer <name> --identity-dir idB
 
 # Throughput benchmark (receiver side, then sender side; sweep with repeated flags)
 cargo run --release -p conduit-cli -- receive --forever --trust --dest recv --identity-dir idA

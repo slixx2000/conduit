@@ -191,18 +191,35 @@ failed verification (that state is suspect) and after a successful finalize.
 
 ## 4. Virtual mount operations (Phase 4)
 
-When a peer is mounted (`conduit-fs`), filesystem callbacks map onto the same session:
+A filesystem session is a persistent peer session serving many request/response pairs. **Session
+classification**: the first control message after `Hello` decides the session kind — `Offer` opens
+a transfer session, `FsRequest` opens a filesystem session that lives until the mounting peer
+disconnects (unmount). The serving side exposes one **share root** (the inbox directory in v1) and
+validates every inbound path share-relative (`""` = the root; no `..`, absolute paths, or drive
+letters).
 
-| FS op | Protocol action |
-|---|---|
-| `readdir` | `ListDir{path}` → `DirListing{entries}` (cached briefly) |
-| `getattr` | `Stat{path}` → `Attr{...}` |
-| `read(off,len)` | `ReadRange{path, off, len}` → streamed chunk(s) |
-| `write(off,buf)` | buffer locally; on flush/close, emit `Offer`+transfer for the file |
-| `rename`/`unlink`/`mkdir` | corresponding `FsMutate{op}` control messages |
+```
+FsRequest  { request_id: u64, op: FsOp }
+FsOp       = ListDir{path} | Stat{path} | ReadRange{path, offset: u64, len: u32}
+           | Mkdir{path} | Unlink{path} | Rename{from, to}
+FsResponse { request_id: u64, result: FsResult }
+FsResult   = DirListing{entries: Vec<FsDirEntry>} | Attr(FsAttr) | ReadStarted{len}
+           | Done | Error{message}
+FsDirEntry = { name, kind: File|Dir, size: u64, modified_unix: u64 }
+```
 
-Reads are lazy/streamed; large writes reuse the chunked transfer engine. Metadata ops are cheap
-control-stream round-trips with short client-side caching to keep the file manager responsive.
+`ReadRange` payloads answer on a **unidirectional stream** — `FsDataHeader{request_id, len}`
+followed by `len` raw bytes — so bulk reads never stall metadata traffic; one request is capped at
+`MAX_FS_READ_BYTES` (8 MiB) and reads short at EOF like an ordinary file. Op failures travel as
+`FsResult::Error` and fail only that op, never the session.
+
+**Writes re-use the transfer engine**: a file written into the mount spools locally on the mounting
+side; when its handle closes, the spool is offered to the peer as an ordinary chunked transfer
+(v1: it lands in the share root under its file name; in-place overwrite of an existing remote file
+is refused; `Unlink` refuses directories).
+
+Reads are lazy/streamed; metadata ops are cheap control-stream round-trips with short client-side
+caching (plus the platform FS driver's own cache) to keep the file manager responsive.
 
 ---
 

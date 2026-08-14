@@ -485,6 +485,50 @@ struct RecvShared {
     events: mpsc::Sender<TransferEvent>,
 }
 
+/// What an inbound session turned out to be, once its first message classified it.
+#[derive(Debug)]
+pub enum Served {
+    /// A transfer session that completed; the payload landed at this path.
+    Transfer(PathBuf),
+    /// A filesystem (mount) session that has ended.
+    FsSession,
+}
+
+/// Serve one inbound session of either kind: a transfer `Offer` is received into
+/// `opts.dest_dir`, a filesystem session serves `share_root` until the peer
+/// unmounts. This is what accept loops call once a session is trusted.
+pub async fn serve_session(
+    session: PeerSession,
+    opts: ReceiveOptions,
+    share_root: PathBuf,
+    events: mpsc::Sender<TransferEvent>,
+) -> Result<Served> {
+    let mut control_recv = session.control_recv_take()?;
+    match wire::read_frame::<ControlMessage>(&mut control_recv).await? {
+        Some(ControlMessage::Offer { manifest }) => {
+            receive_offered(session, control_recv, Arc::new(manifest), opts, events)
+                .await
+                .map(Served::Transfer)
+        }
+        Some(ControlMessage::FsRequest { request_id, op }) => {
+            let result =
+                crate::fsops::serve_fs(&session, control_recv, (request_id, op), share_root)
+                    .await;
+            session.conn.close(0u32.into(), b"fs session over");
+            result.map(|()| Served::FsSession)
+        }
+        Some(ControlMessage::Bye { reason }) => {
+            Err(Error::Connection(format!("peer said goodbye: {reason:?}")))
+        }
+        Some(other) => Err(Error::Protocol(format!(
+            "expected Offer or FsRequest, got {other:?}"
+        ))),
+        None => Err(Error::Connection(
+            "control stream closed before the session was classified".into(),
+        )),
+    }
+}
+
 /// Receive one offered transfer (file or folder) into `opts.dest_dir`. Consumes the
 /// session; auto-accepts the offer (the caller gated trust during pairing). Returns
 /// the final path of the verified payload.
@@ -497,7 +541,7 @@ pub async fn receive_one(
     opts: ReceiveOptions,
     events: mpsc::Sender<TransferEvent>,
 ) -> Result<PathBuf> {
-    // Read the Offer directly — nothing else can arrive first.
+    // Read the Offer directly — this entry point only accepts transfer sessions.
     let mut control_recv = session.control_recv_take()?;
     let manifest = match wire::read_frame::<ControlMessage>(&mut control_recv).await? {
         Some(ControlMessage::Offer { manifest }) => Arc::new(manifest),
@@ -511,7 +555,17 @@ pub async fn receive_one(
             ))
         }
     };
+    receive_offered(session, control_recv, manifest, opts, events).await
+}
 
+/// The transfer flow once an `Offer`'s manifest is in hand.
+async fn receive_offered(
+    session: PeerSession,
+    control_recv: quinn::RecvStream,
+    manifest: Arc<Manifest>,
+    opts: ReceiveOptions,
+    events: mpsc::Sender<TransferEvent>,
+) -> Result<PathBuf> {
     let transfer_id = manifest.transfer_id;
     emit(
         &events,
