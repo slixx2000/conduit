@@ -89,6 +89,11 @@ enum Command {
         #[command(flatten)]
         common: CommonOpts,
     },
+    /// Manage trusted (paired) devices.
+    Trusted {
+        #[command(subcommand)]
+        action: TrustedAction,
+    },
     /// List peers advertising on the network (add --watch to stream changes).
     Peers {
         /// Keep running and print peers as they appear/disappear.
@@ -114,6 +119,30 @@ enum Command {
         /// Chunk sizes (MiB) to try. Repeat the flag to sweep.
         #[arg(long, default_values_t = [4u32])]
         chunk_mib: Vec<u32>,
+        #[command(flatten)]
+        common: CommonOpts,
+    },
+}
+
+#[derive(Subcommand)]
+enum TrustedAction {
+    /// Show every pinned device.
+    List {
+        #[command(flatten)]
+        common: CommonOpts,
+    },
+    /// Give a pinned device a new display name.
+    Rename {
+        /// Device id (or unique prefix) as shown by `trusted list`.
+        id: String,
+        name: String,
+        #[command(flatten)]
+        common: CommonOpts,
+    },
+    /// Un-pin a device: the next connection shows the pairing code again.
+    Revoke {
+        /// Device id (or unique prefix) as shown by `trusted list`.
+        id: String,
         #[command(flatten)]
         common: CommonOpts,
     },
@@ -176,6 +205,8 @@ async fn main() -> ExitCode {
             peer,
             common,
         } => run(mount_cmd(mountpoint, to, peer, common)).await,
+
+        Command::Trusted { action } => run(trusted(action)).await,
 
         Command::Peers { watch, common } => run(peers(watch, common)).await,
 
@@ -593,6 +624,60 @@ async fn peers(watch: bool, common: CommonOpts) -> conduit_core::Result<()> {
                 p.fingerprint,
                 if p.is_compatible() { "" } else { "(incompatible)" },
             );
+        }
+    }
+    Ok(())
+}
+
+/// Manage the pinned-device store from the terminal.
+async fn trusted(action: TrustedAction) -> conduit_core::Result<()> {
+    let common = match &action {
+        TrustedAction::List { common }
+        | TrustedAction::Rename { common, .. }
+        | TrustedAction::Revoke { common, .. } => common,
+    };
+    let dir = identity_dir(common)?;
+    let mut store = TrustStore::load(&dir)?;
+
+    // Resolve a full id or a unique prefix into the stored device id.
+    let resolve = |store: &TrustStore, needle: &str| -> conduit_core::Result<conduit_core::DeviceId> {
+        let matches: Vec<_> = store
+            .peers()
+            .filter(|(id, _)| id.to_string().starts_with(needle))
+            .map(|(id, _)| *id)
+            .collect();
+        match matches.as_slice() {
+            [one] => Ok(*one),
+            [] => Err(conduit_core::Error::Protocol(format!(
+                "no trusted device matches {needle:?} — see `conduit trusted list`"
+            ))),
+            _ => Err(conduit_core::Error::Protocol(format!(
+                "{needle:?} is ambiguous — use more of the id"
+            ))),
+        }
+    };
+
+    match action {
+        TrustedAction::List { .. } => {
+            let mut rows: Vec<_> = store.peers().collect();
+            if rows.is_empty() {
+                println!("no trusted devices yet — pair by sending or receiving once");
+                return Ok(());
+            }
+            rows.sort_by(|a, b| a.1.name.cmp(&b.1.name));
+            for (id, peer) in rows {
+                println!("{id}  {}  fp:{}", peer.name, &peer.fingerprint[..8]);
+            }
+        }
+        TrustedAction::Rename { id, name, .. } => {
+            let id = resolve(&store, &id)?;
+            store.rename(id, &name)?;
+            println!("renamed {id} to {name:?}");
+        }
+        TrustedAction::Revoke { id, .. } => {
+            let id = resolve(&store, &id)?;
+            store.remove(id)?;
+            println!("revoked {id} — the next connection will show a pairing code");
         }
     }
     Ok(())

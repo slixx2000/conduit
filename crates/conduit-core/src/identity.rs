@@ -202,6 +202,18 @@ impl TrustStore {
         Ok(removed)
     }
 
+    /// Give a pinned peer a new display name (the fingerprint stays untouched).
+    pub fn rename(&mut self, peer: DeviceId, name: &str) -> Result<bool> {
+        match self.peers.get_mut(&peer) {
+            Some(entry) => {
+                entry.name = name.to_string();
+                self.save()?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
     pub fn peers(&self) -> impl Iterator<Item = (&DeviceId, &TrustedPeer)> {
         self.peers.iter()
     }
@@ -264,8 +276,20 @@ mod tests {
         assert_eq!(reloaded.status(peer, &fp), TrustStatus::Trusted);
 
         let mut reloaded = reloaded;
+        assert!(reloaded.rename(peer, "Renamed laptop").unwrap());
+        assert_eq!(
+            reloaded.peers().find(|(id, _)| **id == peer).unwrap().1.name,
+            "Renamed laptop"
+        );
+        assert_eq!(
+            reloaded.status(peer, &fp),
+            TrustStatus::Trusted,
+            "renaming must not touch the pin"
+        );
+
         assert!(reloaded.remove(peer).unwrap());
         assert_eq!(reloaded.status(peer, &fp), TrustStatus::Unknown);
+        assert!(!reloaded.rename(peer, "gone").unwrap());
     }
 
     #[test]

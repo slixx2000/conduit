@@ -20,9 +20,20 @@ normative), and `docs/ROADMAP.md` (phase order + acceptance criteria).
 
 ## Current state of the repo
 
-**Phases 0–4 are done on Windows (Phase 2 code-complete pending cable hardware; Phase 4's
-FUSE/macFUSE ports pending a machine to validate on). Phase 5 (polish & release) is the next
-work.** The workspace builds, tests, and lints clean.
+**Phases 0–5 are done on Windows** (pending items are hardware/credential-bound, listed below).
+The workspace builds, tests, and lints clean.
+
+Phase 5: trusted-device management (list/rename/revoke — app section + `conduit trusted`
+subcommand + `TrustStore::rename`), persisted transfer **history** (`history.json`, capped, with
+*Send again / Resume* for outgoing entries — resume rides the scan-based staging), desktop
+**notifications** on finished/failed transfers (`tauri-plugin-notification`, toggleable),
+**settings** (`settings.json`: inbox/shared dir with folder picker, chunk MiB, stream count,
+notifications) applied live to sends/receives/mounts, a user-facing guide in `docs/SETUP.md`, and
+an unsigned Windows `.msi` produced by `npm run tauri build`. **Still pending, deliberately**:
+code-signing the `.msi` and notarizing a `.dmg` (needs certificates/Apple account), `.deb`/AppImage
+and the FUSE/macFUSE mount ports (need those OSes), the Thunderbolt-cable acceptance runs (need
+two cable-linked machines), and SPAKE2 pairing (roadmap-optional; TOFU + exporter-bound codes
+remain the default — revisit if the threat model grows).
 
 Phase 4: `PROTOCOL.md` §4 is implemented — sessions classify on their first control message
 (`Offer` = transfer, `FsRequest` = filesystem), `conduit-core::fsops` provides the serving side

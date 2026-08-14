@@ -58,6 +58,29 @@ type TransferEvent =
 type TransferNotification = { direction: "incoming" | "outgoing"; event: TransferEvent };
 type PairingPrompt = { code: string; peer_name: string; direction: string };
 
+/** Mirrors `TrustedRow` in `src-tauri/src/lib.rs`. */
+type TrustedRow = { id: string; name: string; fingerprint: string };
+
+/** Mirrors `HistoryEntry` in `src-tauri/src/lib.rs`. */
+type HistoryEntry = {
+  time_unix: number;
+  direction: string;
+  name: string;
+  bytes: number;
+  peer: string;
+  status: string;
+  path: string | null;
+  target: string | null;
+};
+
+/** Mirrors `Settings` in `src-tauri/src/lib.rs`. */
+type Settings = {
+  inbox_dir: string | null;
+  chunk_mib: number;
+  streams: number;
+  notifications: boolean;
+};
+
 type Transfer = {
   id: string;
   direction: "incoming" | "outgoing";
@@ -89,6 +112,10 @@ export default function App() {
   const [pairing, setPairing] = useState<PairingPrompt | null>(null);
   const [link, setLink] = useState<LinkStatus | null>(null);
   const [dragging, setDragging] = useState(false);
+  const [trusted, setTrusted] = useState<TrustedRow[]>([]);
+  const [historyList, setHistoryList] = useState<HistoryEntry[]>([]);
+  const [settings, setSettings] = useState<Settings | null>(null);
+  const [renaming, setRenaming] = useState<{ id: string; draft: string } | null>(null);
   const [transfers, setTransfers] = useState<Map<string, Transfer>>(new Map());
   // The transfer list renders newest-first; keep insertion order for stability.
   const orderRef = useRef<string[]>([]);
@@ -175,6 +202,11 @@ export default function App() {
       .then(setStatus)
       .catch((e: unknown) => setBridgeError(e instanceof Error ? e.message : String(e)));
     invoke<PeerRow[]>("peers_snapshot").then(setPeers).catch(() => {});
+    const fetchTrusted = () =>
+      invoke<TrustedRow[]>("trusted_peers").then(setTrusted).catch(() => {});
+    fetchTrusted();
+    invoke<HistoryEntry[]>("history").then(setHistoryList).catch(() => {});
+    invoke<Settings>("get_settings").then(setSettings).catch(() => {});
 
     // Poll the link so plugging in the cable (or an authorization prompt appearing)
     // shows up without a restart.
@@ -185,7 +217,11 @@ export default function App() {
     const unlistens = [
       listen<TransferNotification>("conduit://transfer", (ev) => applyEvent(ev.payload)),
       listen<PairingPrompt>("conduit://pairing", (ev) => setPairing(ev.payload)),
-      listen<PeerRow[]>("conduit://peers", (ev) => setPeers(ev.payload)),
+      listen<PeerRow[]>("conduit://peers", (ev) => {
+        setPeers(ev.payload);
+        fetchTrusted(); // pairing/renaming/revoking all surface through this event
+      }),
+      listen<HistoryEntry[]>("conduit://history", (ev) => setHistoryList(ev.payload)),
       listen<{ message: string }>("conduit://error", (ev) => setLastError(ev.payload.message)),
     ];
 
@@ -263,6 +299,47 @@ export default function App() {
     invoke("set_link_override", { iface })
       .then(() => invoke<LinkStatus>("link_status").then(setLink).catch(() => {}))
       .catch(() => {});
+  }
+
+  async function saveSettings(patch: Partial<Settings>) {
+    if (!settings) return;
+    const next = { ...settings, ...patch };
+    setSettings(next);
+    try {
+      await invoke("set_settings", { settings: next });
+      invoke<NodeStatus>("node_status").then(setStatus).catch(() => {});
+    } catch (e) {
+      setLastError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  async function pickInbox() {
+    const dir = await open({ directory: true, multiple: false });
+    if (typeof dir === "string") await saveSettings({ inbox_dir: dir });
+  }
+
+  async function commitRename() {
+    if (!renaming) return;
+    const { id, draft } = renaming;
+    setRenaming(null);
+    if (draft.trim() === "") return;
+    try {
+      await invoke("rename_trusted", { peerId: id, name: draft.trim() });
+    } catch (e) {
+      setLastError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  async function revoke(id: string) {
+    try {
+      await invoke("revoke_trusted", { peerId: id });
+    } catch (e) {
+      setLastError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  function sendAgain(h: HistoryEntry) {
+    if (h.target && h.path) sendPaths(h.target, [h.path]);
   }
 
   const transferList = orderRef.current
@@ -493,6 +570,189 @@ export default function App() {
               <TransferRow key={t.id} t={t} onCancel={() => cancelTransfer(t.id)} />
             ))}
           </ul>
+        </section>
+      )}
+
+      {/* History */}
+      {historyList.length > 0 && (
+        <section className="rounded-xl bg-conduit-panel p-6 shadow-lg ring-1 ring-white/10">
+          <h2 className="text-sm font-medium uppercase tracking-wide text-slate-400">
+            History
+          </h2>
+          <ul className="mt-3 space-y-2">
+            {historyList.slice(0, 12).map((h, i) => (
+              <li
+                key={`${h.time_unix}-${i}`}
+                className="flex items-center justify-between gap-3 rounded-lg bg-black/20 px-3 py-2 text-sm ring-1 ring-white/10"
+              >
+                <span className="min-w-0 truncate">
+                  <span className="mr-2 text-slate-500">
+                    {h.direction === "incoming" ? "↓" : "↑"}
+                  </span>
+                  <span className="text-slate-100">{h.name}</span>
+                  <span className="ml-2 text-xs text-slate-500">
+                    {humanBytes(h.bytes)} · {h.direction === "incoming" ? "from" : "to"}{" "}
+                    {h.peer} ·{" "}
+                    {new Date(h.time_unix * 1000).toLocaleString(undefined, {
+                      month: "short",
+                      day: "numeric",
+                      hour: "2-digit",
+                      minute: "2-digit",
+                    })}
+                  </span>
+                </span>
+                <span className="flex shrink-0 items-center gap-2">
+                  <span
+                    className={
+                      h.status === "done" ? "text-xs text-emerald-400" : "text-xs text-red-400"
+                    }
+                    title={h.status}
+                  >
+                    {h.status === "done" ? "done" : "failed"}
+                  </span>
+                  {h.direction === "outgoing" && h.target && h.path && (
+                    <button
+                      onClick={() => sendAgain(h)}
+                      className="rounded bg-white/10 px-2 py-0.5 text-xs text-slate-300 hover:bg-white/20"
+                      title="Re-offer the same content — resumes if a partial is staged on the peer"
+                    >
+                      {h.status === "done" ? "Send again" : "Resume"}
+                    </button>
+                  )}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+
+      {/* Trusted devices */}
+      {trusted.length > 0 && (
+        <section className="rounded-xl bg-conduit-panel p-6 shadow-lg ring-1 ring-white/10">
+          <h2 className="text-sm font-medium uppercase tracking-wide text-slate-400">
+            Trusted devices
+          </h2>
+          <ul className="mt-3 space-y-2">
+            {trusted.map((t) => (
+              <li
+                key={t.id}
+                className="flex items-center justify-between gap-3 rounded-lg bg-black/20 px-3 py-2 text-sm ring-1 ring-white/10"
+              >
+                <span className="min-w-0 truncate">
+                  {renaming?.id === t.id ? (
+                    <input
+                      autoFocus
+                      value={renaming.draft}
+                      onChange={(e) => setRenaming({ id: t.id, draft: e.target.value })}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") commitRename();
+                        if (e.key === "Escape") setRenaming(null);
+                      }}
+                      onBlur={commitRename}
+                      className="rounded bg-black/40 px-2 py-0.5 text-sm text-slate-100 outline-none ring-1 ring-conduit-accent"
+                    />
+                  ) : (
+                    <span className="text-slate-100">{t.name}</span>
+                  )}
+                  <span className="ml-2 font-mono text-xs text-slate-500">
+                    fp:{t.fingerprint}
+                  </span>
+                </span>
+                <span className="flex shrink-0 gap-2">
+                  <button
+                    onClick={() => setRenaming({ id: t.id, draft: t.name })}
+                    className="rounded bg-white/10 px-2 py-0.5 text-xs text-slate-300 hover:bg-white/20"
+                  >
+                    Rename
+                  </button>
+                  <button
+                    onClick={() => revoke(t.id)}
+                    className="rounded bg-red-500/20 px-2 py-0.5 text-xs text-red-300 hover:bg-red-500/30"
+                    title="Forget this device — the next connection shows a pairing code again"
+                  >
+                    Revoke
+                  </button>
+                </span>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+
+      {/* Settings */}
+      {settings && (
+        <section className="rounded-xl bg-conduit-panel p-6 shadow-lg ring-1 ring-white/10">
+          <details>
+            <summary className="cursor-pointer text-sm font-medium uppercase tracking-wide text-slate-400">
+              Settings
+            </summary>
+            <div className="mt-4 space-y-4 text-sm">
+              <div className="flex items-center justify-between gap-4">
+                <span className="text-slate-300">
+                  Inbox / shared folder
+                  <span className="ml-2 font-mono text-xs text-slate-500">
+                    {settings.inbox_dir ?? status?.inbox ?? "default"}
+                  </span>
+                </span>
+                <span className="flex shrink-0 gap-2">
+                  <button
+                    onClick={pickInbox}
+                    className="rounded bg-white/10 px-2 py-0.5 text-xs text-slate-300 hover:bg-white/20"
+                  >
+                    Change…
+                  </button>
+                  {settings.inbox_dir && (
+                    <button
+                      onClick={() => saveSettings({ inbox_dir: null })}
+                      className="rounded bg-white/10 px-2 py-0.5 text-xs text-slate-300 hover:bg-white/20"
+                    >
+                      Default
+                    </button>
+                  )}
+                </span>
+              </div>
+              <div className="flex items-center justify-between gap-4">
+                <span className="text-slate-300">
+                  Chunk size (MiB){" "}
+                  <span className="text-xs text-slate-500">
+                    — smaller resumes finer, larger moves faster
+                  </span>
+                </span>
+                <input
+                  type="number"
+                  min={1}
+                  max={64}
+                  value={settings.chunk_mib}
+                  onChange={(e) =>
+                    saveSettings({ chunk_mib: Math.max(1, Number(e.target.value) || 4) })
+                  }
+                  className="w-20 rounded bg-black/30 px-2 py-1 text-right font-mono text-sm text-slate-100 ring-1 ring-white/10"
+                />
+              </div>
+              <div className="flex items-center justify-between gap-4">
+                <span className="text-slate-300">Parallel streams</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={32}
+                  value={settings.streams}
+                  onChange={(e) =>
+                    saveSettings({ streams: Math.max(1, Number(e.target.value) || 4) })
+                  }
+                  className="w-20 rounded bg-black/30 px-2 py-1 text-right font-mono text-sm text-slate-100 ring-1 ring-white/10"
+                />
+              </div>
+              <label className="flex items-center justify-between gap-4">
+                <span className="text-slate-300">Notify when transfers finish or fail</span>
+                <input
+                  type="checkbox"
+                  checked={settings.notifications}
+                  onChange={(e) => saveSettings({ notifications: e.target.checked })}
+                  className="h-4 w-4 accent-[oklch(0.72_0.16_195)]"
+                />
+              </label>
+            </div>
+          </details>
         </section>
       )}
 

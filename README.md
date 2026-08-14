@@ -15,6 +15,14 @@ localhost or LAN with no Thunderbolt hardware.
 
 ## Status
 
+**Phase 5 (polish & release) — complete on Windows.** Trusted-device management
+(rename/revoke pinned devices), persisted transfer history with one-click
+*Send again / Resume*, desktop notifications, and settings (inbox location, chunk
+size, stream count) — plus an unsigned `.msi` installer from `npm run tauri build`.
+See [`docs/SETUP.md`](docs/SETUP.md) for the user guide. Remaining for a public v1:
+code-signing/notarization, Linux/macOS packages and their FUSE mount ports, and
+on-cable validation — all blocked on credentials or hardware, not code.
+
 **Phase 4 (virtual mounted volume) — complete on Windows.** A paired peer mounts as a
 real drive (`conduit mount X: --peer <name>`, or "Mount as drive" in the app): its
 shared folder appears in Explorer, reads stream over the link on demand, and files

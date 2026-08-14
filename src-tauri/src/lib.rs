@@ -20,8 +20,9 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
+use tauri_plugin_notification::NotificationExt;
 use tokio::sync::{mpsc, oneshot, Mutex};
 
 use conduit_core::{
@@ -84,8 +85,13 @@ struct AppState {
     transports: conduit_net::TransportManager,
     /// User-pinned interface name; `None` = auto-select the fastest link.
     link_override: Arc<Mutex<Option<String>>>,
+    settings: Arc<Mutex<Settings>>,
+    settings_path: PathBuf,
+    history: Arc<Mutex<Vec<HistoryEntry>>>,
+    history_path: PathBuf,
     listen_addr: SocketAddr,
-    inbox: PathBuf,
+    /// Fallback inbox when settings name none (Downloads/Conduit).
+    default_inbox: PathBuf,
     device_name: String,
     fingerprint_short: String,
 }
@@ -169,19 +175,202 @@ async fn set_link_override(
 }
 
 #[tauri::command]
-fn node_status(state: State<'_, AppState>) -> NodeStatus {
-    NodeStatus {
+async fn node_status(state: State<'_, AppState>) -> Result<NodeStatus, String> {
+    Ok(NodeStatus {
         device_name: state.device_name.clone(),
         listen_addr: state.listen_addr.to_string(),
-        inbox: state.inbox.display().to_string(),
+        inbox: inbox_dir(&state).await.display().to_string(),
         fingerprint: state.fingerprint_short.clone(),
+    })
+}
+
+#[tauri::command]
+async fn get_settings(state: State<'_, AppState>) -> Result<Settings, String> {
+    Ok(state.settings.lock().await.clone())
+}
+
+#[tauri::command]
+async fn set_settings(state: State<'_, AppState>, settings: Settings) -> Result<(), String> {
+    let json = serde_json::to_vec_pretty(&settings).map_err(|e| e.to_string())?;
+    std::fs::write(&state.settings_path, json).map_err(|e| e.to_string())?;
+    *state.settings.lock().await = settings;
+    Ok(())
+}
+
+#[tauri::command]
+async fn history(state: State<'_, AppState>) -> Result<Vec<HistoryEntry>, String> {
+    Ok(state.history.lock().await.clone())
+}
+
+/// One pinned device in the trust store.
+#[derive(Debug, Serialize)]
+struct TrustedRow {
+    id: String,
+    name: String,
+    fingerprint: String,
+}
+
+#[tauri::command]
+async fn trusted_peers(state: State<'_, AppState>) -> Result<Vec<TrustedRow>, String> {
+    let trust = state.trust.lock().await;
+    let mut rows: Vec<TrustedRow> = trust
+        .peers()
+        .map(|(id, peer)| TrustedRow {
+            id: id.to_string(),
+            name: peer.name.clone(),
+            fingerprint: peer.fingerprint[..8.min(peer.fingerprint.len())].to_string(),
+        })
+        .collect();
+    rows.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(rows)
+}
+
+#[tauri::command]
+async fn rename_trusted(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    peer_id: String,
+    name: String,
+) -> Result<(), String> {
+    let id = DeviceId(peer_id.parse::<uuid::Uuid>().map_err(|_| "bad peer id")?);
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("the name cannot be empty".into());
     }
+    state
+        .trust
+        .lock()
+        .await
+        .rename(id, name)
+        .map_err(|e| e.to_string())?;
+    let _ = app.emit("conduit://peers", peer_rows(&state).await);
+    Ok(())
+}
+
+/// Un-pin a device. The next connection from it shows the pairing code again.
+#[tauri::command]
+async fn revoke_trusted(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    peer_id: String,
+) -> Result<(), String> {
+    let id = DeviceId(peer_id.parse::<uuid::Uuid>().map_err(|_| "bad peer id")?);
+    state
+        .trust
+        .lock()
+        .await
+        .remove(id)
+        .map_err(|e| e.to_string())?;
+    let _ = app.emit("conduit://peers", peer_rows(&state).await);
+    Ok(())
 }
 
 /// A peer mounted as a local drive.
 struct ActiveMount {
     handle: conduit_fs::MountHandle,
     client: FsClient,
+}
+
+/// User-tunable knobs, persisted as `settings.json` in the app config dir.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+struct Settings {
+    /// Where incoming files land (and what peers see when they mount us).
+    /// `None` = the default `Downloads/Conduit`.
+    inbox_dir: Option<String>,
+    /// Transfer chunk size in MiB.
+    chunk_mib: u32,
+    /// Parallel data streams per transfer.
+    streams: usize,
+    /// Desktop notifications on finished/failed transfers.
+    notifications: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            inbox_dir: None,
+            chunk_mib: 4,
+            streams: conduit_core::DEFAULT_STREAM_COUNT,
+            notifications: true,
+        }
+    }
+}
+
+impl Settings {
+    fn send_options(&self) -> SendOptions {
+        SendOptions {
+            chunk_size: self.chunk_mib.clamp(1, 64) * 1024 * 1024,
+            streams: self.streams.clamp(1, 32),
+            corrupt_chunk_once: None,
+        }
+    }
+}
+
+/// One finished (or failed) transfer, newest first, persisted as `history.json`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HistoryEntry {
+    time_unix: u64,
+    /// "incoming" | "outgoing".
+    direction: String,
+    name: String,
+    bytes: u64,
+    peer: String,
+    /// "done" or "failed: <reason>".
+    status: String,
+    /// Destination path for incoming, source path for outgoing.
+    path: Option<String>,
+    /// Outgoing only: the target this went to, so "Send again" can re-offer —
+    /// which resumes instead of restarting if a partial is staged over there.
+    target: Option<String>,
+}
+
+const HISTORY_CAP: usize = 200;
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+async fn append_history(app: &AppHandle, entry: HistoryEntry) {
+    let state = app.state::<AppState>();
+    let snapshot = {
+        let mut history = state.history.lock().await;
+        history.insert(0, entry);
+        history.truncate(HISTORY_CAP);
+        history.clone()
+    };
+    if let Ok(json) = serde_json::to_vec_pretty(&snapshot) {
+        let _ = std::fs::write(&state.history_path, json);
+    }
+    let _ = app.emit("conduit://history", snapshot);
+}
+
+/// Desktop notification, honoring the settings toggle. Never fails a transfer.
+async fn notify(app: &AppHandle, title: &str, body: &str) {
+    let enabled = app.state::<AppState>().settings.lock().await.notifications;
+    if enabled {
+        let _ = app
+            .notification()
+            .builder()
+            .title(title)
+            .body(body)
+            .show();
+    }
+}
+
+/// The current inbox/shared directory, per settings.
+async fn inbox_dir(state: &AppState) -> PathBuf {
+    state
+        .settings
+        .lock()
+        .await
+        .inbox_dir
+        .as_ref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| state.default_inbox.clone())
 }
 
 /// One row of the UI's peer list.
@@ -276,8 +465,9 @@ async fn mount_peer(
                     let session = pair_with_ui(&app, session, "outgoing")
                         .await
                         .map_err(|e| e.to_string())?;
+                    let opts = state.settings.lock().await.send_options();
                     let events = forward_events(app.clone(), "outgoing", None);
-                    conduit_core::send_path(session, &spool, SendOptions::default(), events)
+                    conduit_core::send_path(session, &spool, opts, events)
                         .await
                         .map_err(|e| e.to_string())
                 }
@@ -378,7 +568,7 @@ async fn send_to_peer(
         let task = tokio::spawn({
             let app = app.clone();
             async move {
-                let mut last_err: Option<String> = None;
+                let mut outcome: Result<(), String> = Err("never attempted".into());
                 for attempt in 0..=SEND_RETRIES {
                     if attempt > 0 {
                         tokio::time::sleep(SEND_RETRY_DELAY).await;
@@ -390,40 +580,77 @@ async fn send_to_peer(
                         Ok(a) => a,
                         Err(_) if attempt < SEND_RETRIES => continue,
                         Err(e) => {
-                            last_err = Some(e);
+                            outcome = Err(e);
                             break;
                         }
                     };
+                    let opts = state.settings.lock().await.send_options();
                     let result = async {
                         let session = state.endpoint.connect_any(&candidates).await?;
                         let session = pair_with_ui(&app, session, "outgoing").await?;
-                        conduit_core::send_path(
-                            session,
-                            Path::new(&path),
-                            SendOptions::default(),
-                            events.clone(),
-                        )
-                        .await
+                        conduit_core::send_path(session, Path::new(&path), opts, events.clone())
+                            .await
                     }
                     .await;
 
                     match result {
-                        Ok(()) => return,
-                        // The pairing verdict is final — never redial into a second prompt.
+                        Ok(()) => {
+                            outcome = Ok(());
+                            break;
+                        }
+                        // The pairing verdict is final — never redial into a second
+                        // prompt, and a rejected pairing is not history-worthy.
                         Err(conduit_core::Error::PairingRejected) => return,
                         Err(e @ conduit_core::Error::Connection(_)) => {
-                            last_err = Some(e.to_string());
+                            outcome = Err(e.to_string());
                             continue; // transient: redial and resume
                         }
                         Err(e) => {
-                            last_err = Some(e.to_string());
+                            outcome = Err(e.to_string());
                             break;
                         }
                     }
                 }
-                if let Some(e) = last_err {
-                    emit_error(&app, format!("send failed: {e}"));
+
+                let source = Path::new(&path);
+                let name = source
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.clone());
+                let bytes = std::fs::metadata(source).map(|m| m.len()).unwrap_or(0);
+                let peer_name = {
+                    let state = app.state::<AppState>();
+                    let peers = state.peers.lock().await;
+                    target
+                        .parse::<uuid::Uuid>()
+                        .ok()
+                        .and_then(|u| peers.get(&DeviceId(u)).map(|p| p.name.clone()))
+                        .unwrap_or_else(|| target.clone())
+                };
+                match &outcome {
+                    Ok(()) => notify(&app, "Transfer complete", &format!("Sent {name} to {peer_name}")).await,
+                    Err(e) => {
+                        emit_error(&app, format!("send failed: {e}"));
+                        notify(&app, "Transfer failed", &format!("{name}: {e}")).await;
+                    }
                 }
+                append_history(
+                    &app,
+                    HistoryEntry {
+                        time_unix: now_unix(),
+                        direction: "outgoing".into(),
+                        name,
+                        bytes,
+                        peer: peer_name,
+                        status: match &outcome {
+                            Ok(()) => "done".into(),
+                            Err(e) => format!("failed: {e}"),
+                        },
+                        path: Some(path.clone()),
+                        target: Some(target.clone()),
+                    },
+                )
+                .await;
             }
         });
         let _ = abort_slot.set(task.abort_handle());
@@ -588,7 +815,7 @@ async fn accept_loop(app: AppHandle) {
             Some(Ok(session)) => {
                 let app = app.clone();
                 tauri::async_runtime::spawn(async move {
-                    let inbox = app.state::<AppState>().inbox.clone();
+                    let inbox = inbox_dir(&app.state::<AppState>()).await;
                     let session = match pair_with_ui(&app, session, "incoming").await {
                         Ok(s) => s,
                         Err(conduit_core::Error::PairingRejected) => return,
@@ -597,6 +824,7 @@ async fn accept_loop(app: AppHandle) {
                             return;
                         }
                     };
+                    let peer_name = session.peer.name.clone();
                     // Registered for cancellation like outgoing sends; an aborted
                     // receive keeps its staged partial for a later resume.
                     let abort_slot = Arc::new(std::sync::OnceLock::new());
@@ -617,12 +845,48 @@ async fn accept_loop(app: AppHandle) {
                             )
                             .await
                             {
-                                Ok(Served::Transfer(_)) | Ok(Served::FsSession) => {}
+                                Ok(Served::Transfer(path)) => {
+                                    let name = path
+                                        .file_name()
+                                        .map(|n| n.to_string_lossy().into_owned())
+                                        .unwrap_or_else(|| path.display().to_string());
+                                    let bytes =
+                                        std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                                    notify(
+                                        &app,
+                                        "File received",
+                                        &format!("{name} from {peer_name}"),
+                                    )
+                                    .await;
+                                    append_history(
+                                        &app,
+                                        HistoryEntry {
+                                            time_unix: now_unix(),
+                                            direction: "incoming".into(),
+                                            name,
+                                            bytes,
+                                            peer: peer_name,
+                                            status: "done".into(),
+                                            path: Some(path.display().to_string()),
+                                            target: None,
+                                        },
+                                    )
+                                    .await;
+                                }
+                                Ok(Served::FsSession) => {}
                                 // Connection loss is routine (sender will redial and
                                 // resume); anything else deserves a visible error on
                                 // top of the transfer's own Failed event.
                                 Err(conduit_core::Error::Connection(_)) => {}
-                                Err(e) => emit_error(&app, e.to_string()),
+                                Err(e) => {
+                                    emit_error(&app, e.to_string());
+                                    notify(
+                                        &app,
+                                        "Transfer failed",
+                                        &format!("from {peer_name}: {e}"),
+                                    )
+                                    .await;
+                                }
                             }
                         }
                     });
@@ -643,13 +907,25 @@ fn host_name() -> String {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             let identity_dir = app.path().app_config_dir()?;
-            let inbox = app
+            let default_inbox = app
                 .path()
                 .download_dir()
                 .map(|d| d.join("Conduit"))
                 .unwrap_or_else(|_| identity_dir.join("inbox"));
+
+            let settings_path = identity_dir.join("settings.json");
+            let settings: Settings = std::fs::read(&settings_path)
+                .ok()
+                .and_then(|b| serde_json::from_slice(&b).ok())
+                .unwrap_or_default();
+            let history_path = identity_dir.join("history.json");
+            let history: Vec<HistoryEntry> = std::fs::read(&history_path)
+                .ok()
+                .and_then(|b| serde_json::from_slice(&b).ok())
+                .unwrap_or_default();
 
             let identity = Arc::new(DeviceIdentity::load_or_create(&identity_dir, &host_name())?);
             let trust = TrustStore::load(&identity_dir)?;
@@ -686,7 +962,11 @@ pub fn run() {
                 _discovery: discovery,
                 transports: conduit_net::TransportManager::with_defaults(),
                 link_override: Arc::new(Mutex::new(None)),
-                inbox,
+                settings: Arc::new(Mutex::new(settings)),
+                settings_path,
+                history: Arc::new(Mutex::new(history)),
+                history_path,
+                default_inbox,
                 device_name: identity.device_name.clone(),
                 fingerprint_short: identity.fingerprint().short(),
             });
@@ -726,7 +1006,13 @@ pub fn run() {
             cancel_transfer,
             mount_peer,
             unmount_peer,
-            confirm_pairing
+            confirm_pairing,
+            get_settings,
+            set_settings,
+            history,
+            trusted_peers,
+            rename_trusted,
+            revoke_trusted
         ])
         .run(tauri::generate_context!())
         .expect("error while running Conduit");

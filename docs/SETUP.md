@@ -1,0 +1,81 @@
+# Conduit — Setup Guide
+
+Conduit moves files between two laptops over the fastest link they share — a
+Thunderbolt/USB4 cable, a plain Ethernet cable, a USB bridge cable, or ordinary
+WiFi — always encrypted, always verified. This guide is for using the app; the
+technical docs live next to it in `docs/`.
+
+## 1. Install
+
+**Windows**: run the Conduit `.msi` installer. To use *Mount as drive* you also need
+the free [WinFsp](https://winfsp.dev/rel/) driver (one-time install; Conduit tells
+you if it's missing). Everything else works without it.
+
+**Linux / macOS**: packages are not produced yet — build from source (see
+`README.md`). Mounting will need FUSE/macFUSE once those ports land.
+
+The first launch creates your device identity and starts listening. There is no
+account and no server: everything is directly between your two machines.
+
+## 2. Connect the machines
+
+Any of these works — Conduit picks the fastest automatically and shows it in the
+**Connection** panel (you can pin a different one):
+
+- **Thunderbolt / USB4 cable** (fastest). On Windows and Linux the first plug-in may
+  need you to *authorize* the device: watch for the OS prompt, or on Linux run
+  `boltctl list` / `boltctl authorize <uuid>`. Conduit shows a banner while a device
+  is waiting for approval.
+- **Ethernet cable straight between the two laptops** — no router, no settings.
+  Modern network ports handle this automatically (link-local addressing; no
+  crossover cable needed).
+- **USB laptop-to-laptop bridge cable** (CDC-NCM type).
+- **Same WiFi network** — the always-works fallback, just slower.
+
+## 3. Pair (first time only)
+
+Open Conduit on both machines. Each sees the other in **Peers** within a few
+seconds. Start a transfer (or mount) and both screens show the same **6-digit
+code** — confirm it matches on both, once. After that the devices trust each other
+and connect silently.
+
+If the code ever *doesn't* match, reject it: something is interfering with the
+connection. Manage pairings under **Trusted devices** (rename, revoke).
+
+## 4. Transfer
+
+- **Drag files or a folder onto a peer card** (or use *Send file / Send folder*).
+- Progress shows on both machines; every chunk is integrity-checked (BLAKE3) and
+  the file is verified whole before it appears — never a silent corruption.
+- Incoming files land in your **inbox** (default `Downloads/Conduit`; change it in
+  Settings). The inbox is also what peers see when they mount you.
+- **Interruptions are safe.** Pull the cable mid-transfer and reconnect: the
+  transfer resumes where it stopped. Cancel keeps the partial for the same reason —
+  *Resume* from History re-offers it.
+
+## 5. Mount a peer as a drive
+
+Click **Mount as drive** on a peer (Windows; needs WinFsp). The peer's inbox
+appears as a drive letter in Explorer: browse it, open files (they stream on
+demand), copy files off it, or copy files onto it — those travel through the same
+verified transfer pipeline. *Unmount* (or quitting the app) removes the drive.
+
+Current mount limits: copying *over* an existing file on the drive is refused
+(copy under a new name instead), and deleting folders through the drive is not
+supported yet.
+
+## 6. Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| Peer doesn't appear | Both apps running? Same network or cable connected? Some networks block mDNS — use "Connect by address" with the ip:port from the other machine's header. |
+| "waiting for authorization" banner | Approve the Thunderbolt device in your OS (Linux: `boltctl authorize`, or the desktop prompt). |
+| Mount button fails with "WinFsp is required" | Install WinFsp from winfsp.dev and retry. |
+| Pairing code shown again for a known device | Its identity changed (reinstall) — or someone is impersonating it. Verify with the other person, revoke the old entry under Trusted devices, and re-pair. |
+| Transfer failed mid-way | Just send again — it resumes from what already arrived intact. |
+| Slow over WiFi | That's WiFi. Plug in any cable; the Connection panel shows what's in use. |
+
+## 7. Headless / scripting
+
+The `conduit` CLI drives everything without the GUI: `receive`, `send`, `mount`,
+`peers`, `trusted`, `bench`, `hash`. See `README.md` for examples.
