@@ -1,0 +1,15 @@
+[package]
+name = "conduit-fs"
+description = "Virtual mounted volume backed by a Conduit peer (Phase 4)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+conduit-core.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+# Phase 4 adds the platform backends here:
+#   [target.'cfg(unix)'.dependencies]  fuser = "0.14"
+#   [target.'cfg(windows)'.dependencies]  winfsp = "0.2"

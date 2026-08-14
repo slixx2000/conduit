@@ -1,0 +1,10 @@
+[package]
+name = "conduit-net"
+description = "Thunderbolt/USB4 interface detection and preferred-address selection."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true

@@ -1,0 +1,44 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/conduit-core",
+    "crates/conduit-discovery",
+    "crates/conduit-net",
+    "crates/conduit-fs",
+    "crates/conduit-cli",
+    "src-tauri",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/REPLACE_ME/conduit"
+
+[workspace.dependencies]
+# Internal crates
+conduit-core = { path = "crates/conduit-core" }
+conduit-discovery = { path = "crates/conduit-discovery" }
+conduit-net = { path = "crates/conduit-net" }
+conduit-fs = { path = "crates/conduit-fs" }
+
+# Shared third-party. The transport stack (quinn/rustls, Phase 1) pins the `ring`
+# crypto backend rather than aws-lc-rs so Windows builds need no cmake/NASM toolchain.
+# mdns-sd lands in Phase 3, fuser/winfsp in Phase 4.
+blake3 = "1"
+dirs = "5"
+postcard = { version = "1", features = ["use-std"] }
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+rcgen = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "time"] }
+tracing = "0.1"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[profile.release]
+# Transfers are throughput-bound; prefer optimized codegen over compile time.
+lto = "thin"
+codegen-units = 1

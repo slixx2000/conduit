@@ -1,0 +1,11 @@
+[package]
+name = "conduit-discovery"
+description = "mDNS/DNS-SD peer advertisement and browsing for Conduit."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+conduit-core.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

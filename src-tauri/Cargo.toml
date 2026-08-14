@@ -1,0 +1,27 @@
+[package]
+name = "conduit-app"
+description = "Conduit desktop shell. Thin glue between the UI and the core crates."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+# `cdylib`/`staticlib` are required for the mobile targets Tauri v2 supports; `rlib`
+# lets `main.rs` (and tests) link against it.
+name = "conduit_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+conduit-core.workspace = true
+conduit-discovery.workspace = true
+conduit-fs.workspace = true
+conduit-net.workspace = true
+
+serde.workspace = true
+serde_json = "1"
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tokio.workspace = true

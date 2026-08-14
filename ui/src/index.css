@@ -1,0 +1,15 @@
+@import "tailwindcss";
+
+/* Tailwind v4 is configured in CSS rather than a JS config file. Project tokens go
+   here as they are decided; Phase 0 only needs the dark shell the app renders into. */
+@theme {
+  --color-conduit-bg: oklch(0.18 0.02 265);
+  --color-conduit-panel: oklch(0.24 0.02 265);
+  --color-conduit-accent: oklch(0.72 0.16 195);
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}

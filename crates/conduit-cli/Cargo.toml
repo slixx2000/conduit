@@ -1,0 +1,20 @@
+[package]
+name = "conduit-cli"
+description = "Headless Conduit driver for scripted end-to-end tests and throughput benchmarks."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "conduit"
+path = "src/main.rs"
+
+[dependencies]
+conduit-core.workspace = true
+conduit-discovery.workspace = true
+conduit-fs.workspace = true
+conduit-net.workspace = true
+
+clap = { version = "4", features = ["derive"] }
+dirs.workspace = true
+tokio.workspace = true

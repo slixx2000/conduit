@@ -1,0 +1,19 @@
+# Rust
+/target
+**/*.rs.bk
+
+# Node / frontend
+node_modules/
+ui/dist/
+*.log
+
+# Tauri generated
+src-tauri/gen/
+src-tauri/target/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Per-developer tool settings (shared settings.json is tracked)
+.claude/settings.local.json
