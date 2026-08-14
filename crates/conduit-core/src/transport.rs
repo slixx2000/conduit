@@ -87,6 +87,29 @@ impl ConduitEndpoint {
         PeerSession::establish(conn, &self.identity, Side::Initiator).await
     }
 
+    /// Dial the first reachable of several candidate addresses (a discovered peer
+    /// advertises one per interface — cable, LAN, WiFi — and not all are reachable
+    /// from here). Candidates are tried in the given order, a few seconds each;
+    /// the first successful session wins.
+    pub async fn connect_any(&self, candidates: &[SocketAddr]) -> Result<PeerSession> {
+        let mut last: Option<Error> = None;
+        for &addr in candidates {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                self.connect(addr),
+            )
+            .await
+            {
+                Ok(Ok(session)) => return Ok(session),
+                Ok(Err(e)) => last = Some(e),
+                Err(_) => {
+                    last = Some(Error::Connection(format!("timed out connecting to {addr}")))
+                }
+            }
+        }
+        Err(last.unwrap_or_else(|| Error::Connection("no addresses to dial".into())))
+    }
+
     /// Accept the next inbound connection and complete the `Hello` exchange.
     /// Returns `None` once the endpoint is closed. Same trust caveat as [`connect`].
     pub async fn accept(&self) -> Option<Result<PeerSession>> {

@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use conduit_core::{
-    receive_one, send_file, ByeReason, ConduitEndpoint, DeviceIdentity, PeerSession,
+    receive_one, send_path, ByeReason, ConduitEndpoint, DeviceIdentity, PeerSession,
     ReceiveOptions, SendOptions, TransferEvent, TrustStatus, TrustStore,
 };
 use tokio::sync::mpsc;
@@ -54,19 +54,32 @@ enum Command {
         #[command(flatten)]
         common: CommonOpts,
     },
-    /// Send one file to a listening peer.
+    /// Send a file or folder to a listening peer.
     Send {
-        /// File to send.
+        /// File or folder to send.
         file: PathBuf,
         /// Peer address, e.g. 192.168.1.20:4433 (printed by `conduit receive`).
+        /// Optional when --peer finds the target via mDNS.
+        #[arg(long, conflicts_with = "peer")]
+        to: Option<SocketAddr>,
+        /// Discover the peer by (a substring of) its advertised name instead of
+        /// typing an address.
         #[arg(long)]
-        to: SocketAddr,
+        peer: Option<String>,
         /// Parallel QUIC data streams.
         #[arg(long, default_value_t = conduit_core::DEFAULT_STREAM_COUNT)]
         streams: usize,
         /// Chunk size in MiB.
         #[arg(long, default_value_t = 4)]
         chunk_mib: u32,
+        #[command(flatten)]
+        common: CommonOpts,
+    },
+    /// List peers advertising on the network (add --watch to stream changes).
+    Peers {
+        /// Keep running and print peers as they appear/disappear.
+        #[arg(long)]
+        watch: bool,
         #[command(flatten)]
         common: CommonOpts,
     },
@@ -137,10 +150,13 @@ async fn main() -> ExitCode {
         Command::Send {
             file,
             to,
+            peer,
             streams,
             chunk_mib,
             common,
-        } => run(send(file, to, streams, chunk_mib, common)).await,
+        } => run(send(file, to, peer, streams, chunk_mib, common)).await,
+
+        Command::Peers { watch, common } => run(peers(watch, common)).await,
 
         Command::Bench {
             to,
@@ -169,10 +185,14 @@ async fn receive(
     common: CommonOpts,
 ) -> conduit_core::Result<()> {
     let (endpoint, mut store) = open_endpoint(&common, listen)?;
+    let local = endpoint.local_addr()?;
     println!(
-        "listening on {} — run `conduit send <file> --to <this address>` on the peer",
-        endpoint.local_addr()?
+        "listening on {local} — `conduit send <file> --peer <name>` (or --to <this address>) on the peer",
     );
+
+    // Advertise over mDNS so senders find us without an address. The handle must
+    // stay alive for the advertisement to persist.
+    let _discovery = announce(&common, local.port())?;
 
     loop {
         let session = match endpoint.accept().await {
@@ -207,15 +227,26 @@ async fn receive(
 
 async fn send(
     file: PathBuf,
-    to: SocketAddr,
+    to: Option<SocketAddr>,
+    peer: Option<String>,
     streams: usize,
     chunk_mib: u32,
     common: CommonOpts,
 ) -> conduit_core::Result<()> {
     let (endpoint, mut store) = open_endpoint(&common, "0.0.0.0:0".parse().unwrap())?;
 
-    println!("connecting to {to} …");
-    let session = endpoint.connect(to).await?;
+    let candidates = match (to, peer) {
+        (Some(addr), _) => vec![addr],
+        (None, Some(needle)) => find_peer(&common, &needle).await?,
+        (None, None) => {
+            return Err(conduit_core::Error::Protocol(
+                "pass --peer <name> or --to <ip:port>".into(),
+            ))
+        }
+    };
+
+    println!("connecting to {candidates:?} …");
+    let session = endpoint.connect_any(&candidates).await?;
     println!("connected to {}", session.peer.name);
 
     let session = pair(session, &mut store, common.trust).await?;
@@ -227,7 +258,7 @@ async fn send(
     };
     let (events_tx, events_rx) = mpsc::channel(256);
     let printer = tokio::spawn(print_events(events_rx));
-    let result = send_file(session, &file, opts, events_tx).await;
+    let result = send_path(session, &file, opts, events_tx).await;
     let _ = printer.await;
 
     result?;
@@ -277,7 +308,7 @@ async fn bench(
             let drain = tokio::spawn(async move { while events_rx.recv().await.is_some() {} });
 
             let started = std::time::Instant::now();
-            let result = send_file(session, &payload, opts, events_tx).await;
+            let result = send_path(session, &payload, opts, events_tx).await;
             let elapsed = started.elapsed().as_secs_f64();
             let _ = drain.await;
             result?;
@@ -309,20 +340,155 @@ fn tempfile_dir() -> std::io::Result<PathBuf> {
     Ok(dir)
 }
 
-fn open_endpoint(
+/// Advertise this device so peers can find it by name. Uses the identity that
+/// `open_endpoint` created (or creates it, same directory rules).
+fn announce(
     common: &CommonOpts,
-    listen: SocketAddr,
-) -> conduit_core::Result<(ConduitEndpoint, TrustStore)> {
-    let dir = common
+    port: u16,
+) -> conduit_core::Result<conduit_discovery::Discovery> {
+    let identity = load_identity(common)?;
+    conduit_discovery::Discovery::start(&conduit_discovery::Announcement {
+        device_id: identity.device_id,
+        device_name: identity.device_name.clone(),
+        port,
+        fingerprint: identity.fingerprint().short(),
+    })
+    .map_err(|e| conduit_core::Error::Protocol(format!("discovery failed: {e}")))
+}
+
+/// Browse until a peer whose name (or id) contains `needle` appears; returns its
+/// dial candidates, best-first.
+async fn find_peer(common: &CommonOpts, needle: &str) -> conduit_core::Result<Vec<SocketAddr>> {
+    let identity = load_identity(common)?;
+    let discovery = conduit_discovery::Discovery::start(&conduit_discovery::Announcement {
+        device_id: identity.device_id,
+        device_name: identity.device_name.clone(),
+        port: 0,
+        fingerprint: identity.fingerprint().short(),
+    })
+    .map_err(|e| conduit_core::Error::Protocol(format!("discovery failed: {e}")))?;
+    let mut events = discovery
+        .subscribe(identity.device_id)
+        .map_err(|e| conduit_core::Error::Protocol(format!("discovery failed: {e}")))?;
+
+    println!("looking for a peer matching {needle:?} …");
+    let needle_lower = needle.to_lowercase();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let event = tokio::time::timeout_at(deadline, events.recv())
+            .await
+            .map_err(|_| {
+                conduit_core::Error::Protocol(format!(
+                    "no peer matching {needle:?} appeared within 15s — is Conduit \
+                     listening on the other machine? (`conduit peers` lists what's visible)"
+                ))
+            })?;
+        match event {
+            Some(conduit_discovery::PeerEvent::Found(p))
+                if p.name.to_lowercase().contains(&needle_lower)
+                    || p.id.to_string().starts_with(&needle_lower) =>
+            {
+                if !p.is_compatible() {
+                    return Err(conduit_core::Error::VersionMismatch {
+                        local: conduit_core::PROTOCOL_VERSION,
+                        peer: p.version,
+                    });
+                }
+                println!("found {} at {:?}", p.name, p.socket_addrs());
+                return Ok(p.socket_addrs());
+            }
+            Some(_) => continue,
+            None => {
+                return Err(conduit_core::Error::Protocol(
+                    "discovery stream ended unexpectedly".into(),
+                ))
+            }
+        }
+    }
+}
+
+/// Print advertising peers; with `--watch`, keep streaming appear/disappear events.
+async fn peers(watch: bool, common: CommonOpts) -> conduit_core::Result<()> {
+    let identity = load_identity(&common)?;
+    let discovery = conduit_discovery::Discovery::start(&conduit_discovery::Announcement {
+        device_id: identity.device_id,
+        device_name: identity.device_name.clone(),
+        port: 0,
+        fingerprint: identity.fingerprint().short(),
+    })
+    .map_err(|e| conduit_core::Error::Protocol(format!("discovery failed: {e}")))?;
+    let mut events = discovery
+        .subscribe(identity.device_id)
+        .map_err(|e| conduit_core::Error::Protocol(format!("discovery failed: {e}")))?;
+
+    if watch {
+        println!("watching for peers (ctrl-c to stop) …");
+        while let Some(event) = events.recv().await {
+            match event {
+                conduit_discovery::PeerEvent::Found(p) => {
+                    println!(
+                        "+ {}  {:?}  v{}  fp:{}  {}",
+                        p.name,
+                        p.socket_addrs(),
+                        p.version,
+                        p.fingerprint,
+                        if p.is_compatible() { "" } else { "(incompatible)" },
+                    );
+                }
+                conduit_discovery::PeerEvent::Lost(id) => println!("- {id}"),
+            }
+        }
+        return Ok(());
+    }
+
+    // One-shot: collect for a few seconds, then print a table.
+    let mut found: Vec<conduit_discovery::Peer> = Vec::new();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(4);
+    while let Ok(Some(event)) = tokio::time::timeout_at(deadline, events.recv()).await {
+        if let conduit_discovery::PeerEvent::Found(p) = event {
+            if !found.iter().any(|f| f.id == p.id) {
+                found.push(p);
+            }
+        }
+    }
+    if found.is_empty() {
+        println!("no peers found — is Conduit running on the other machine?");
+    } else {
+        for p in found {
+            println!(
+                "{}  {:?}  v{}  fp:{}  {}",
+                p.name,
+                p.socket_addrs(),
+                p.version,
+                p.fingerprint,
+                if p.is_compatible() { "" } else { "(incompatible)" },
+            );
+        }
+    }
+    Ok(())
+}
+
+fn load_identity(common: &CommonOpts) -> conduit_core::Result<Arc<DeviceIdentity>> {
+    let dir = identity_dir(common)?;
+    Ok(Arc::new(DeviceIdentity::load_or_create(&dir, &host_name())?))
+}
+
+fn identity_dir(common: &CommonOpts) -> conduit_core::Result<PathBuf> {
+    common
         .identity_dir
         .clone()
         .or_else(|| dirs::config_dir().map(|d| d.join("conduit")))
         .ok_or_else(|| {
-            conduit_core::Error::Crypto(
-                "no OS config directory found — pass --identity-dir".into(),
-            )
-        })?;
-    let identity = Arc::new(DeviceIdentity::load_or_create(&dir, &host_name())?);
+            conduit_core::Error::Crypto("no OS config directory found — pass --identity-dir".into())
+        })
+}
+
+fn open_endpoint(
+    common: &CommonOpts,
+    listen: SocketAddr,
+) -> conduit_core::Result<(ConduitEndpoint, TrustStore)> {
+    let dir = identity_dir(common)?;
+    let identity = load_identity(common)?;
     let store = TrustStore::load(&dir)?;
     let endpoint = ConduitEndpoint::bind(identity, listen)?;
     Ok((endpoint, store))
@@ -405,6 +571,9 @@ async fn print_events(mut events: mpsc::Receiver<TransferEvent>) {
                     human_bytes(total_bytes)
                 );
                 let _ = std::io::stdout().flush();
+            }
+            TransferEvent::Resumed { bytes_already, .. } => {
+                println!("resuming — {} already verified on disk", human_bytes(bytes_already));
             }
             TransferEvent::ChunkResent { entry_index, chunk_index, .. } => {
                 println!("\n  chunk {chunk_index} of entry {entry_index} failed its hash — resending");

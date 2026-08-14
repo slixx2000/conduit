@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
 
 /** Mirrors `NodeStatus` in `src-tauri/src/lib.rs`. */
@@ -11,10 +12,23 @@ type NodeStatus = {
   fingerprint: string;
 };
 
+/** Mirrors `PeerRow` in `src-tauri/src/lib.rs`. */
+type PeerRow = {
+  id: string;
+  name: string;
+  addr: string;
+  trusted: boolean;
+  compatible: boolean;
+};
+
+/** Mirrors `LinkStatus` in `src-tauri/src/lib.rs`. */
+type LinkStatus = { preferred: string | null; unauthorized: string[] };
+
 /** Mirrors `TransferEvent` in `conduit-core` (serde tag = "kind"). */
 type TransferEvent =
   | { kind: "offered"; transfer_id: string; name: string; total_bytes: number }
   | { kind: "started"; transfer_id: string; name: string; total_bytes: number }
+  | { kind: "resumed"; transfer_id: string; bytes_already: number }
   | {
       kind: "progress";
       transfer_id: string;
@@ -33,9 +47,6 @@ type TransferEvent =
 
 type TransferNotification = { direction: "incoming" | "outgoing"; event: TransferEvent };
 type PairingPrompt = { code: string; peer_name: string; direction: string };
-
-/** Mirrors `LinkStatus` in `src-tauri/src/lib.rs`. */
-type LinkStatus = { preferred: string | null; unauthorized: string[] };
 
 type Transfer = {
   id: string;
@@ -62,14 +73,17 @@ function humanBytes(b: number): string {
 export default function App() {
   const [status, setStatus] = useState<NodeStatus | null>(null);
   const [bridgeError, setBridgeError] = useState<string | null>(null);
-  const [peerAddr, setPeerAddr] = useState("");
-  const [sending, setSending] = useState(false);
+  const [peers, setPeers] = useState<PeerRow[]>([]);
+  const [manualAddr, setManualAddr] = useState("");
   const [lastError, setLastError] = useState<string | null>(null);
   const [pairing, setPairing] = useState<PairingPrompt | null>(null);
   const [link, setLink] = useState<LinkStatus | null>(null);
+  const [dragging, setDragging] = useState(false);
   const [transfers, setTransfers] = useState<Map<string, Transfer>>(new Map());
   // The transfer list renders newest-first; keep insertion order for stability.
   const orderRef = useRef<string[]>([]);
+  const peersRef = useRef<PeerRow[]>([]);
+  peersRef.current = peers;
 
   const applyEvent = useCallback((n: TransferNotification) => {
     setTransfers((prev) => {
@@ -89,7 +103,19 @@ export default function App() {
       switch (e.kind) {
         case "offered":
         case "started":
-          next.set(e.transfer_id, { ...base, name: e.name, totalBytes: e.total_bytes });
+          next.set(e.transfer_id, {
+            ...base,
+            name: e.name,
+            totalBytes: e.total_bytes,
+            state: "running", // a redialed transfer goes back to running
+          });
+          break;
+        case "resumed":
+          next.set(e.transfer_id, {
+            ...base,
+            bytesDone: e.bytes_already,
+            detail: `resumed — ${humanBytes(e.bytes_already)} already transferred`,
+          });
           break;
         case "progress":
           next.set(e.transfer_id, {
@@ -123,15 +149,25 @@ export default function App() {
     });
   }, []);
 
+  const sendPaths = useCallback((target: string, paths: string[]) => {
+    setLastError(null);
+    for (const path of paths) {
+      invoke("send_to_peer", { target, path }).catch((e: unknown) =>
+        setLastError(e instanceof Error ? e.message : String(e)),
+      );
+    }
+  }, []);
+
   useEffect(() => {
     // Running under `vite` alone (no Tauri host) there is no IPC bridge. That is a
     // normal way to work on the UI, so report it as a state rather than an error.
     invoke<NodeStatus>("node_status")
       .then(setStatus)
       .catch((e: unknown) => setBridgeError(e instanceof Error ? e.message : String(e)));
+    invoke<PeerRow[]>("peers_snapshot").then(setPeers).catch(() => {});
 
     // Poll the link so plugging in the cable (or an authorization prompt appearing)
-    // shows up without a restart. Discovery events replace this in Phase 3.
+    // shows up without a restart.
     const pollLink = () => invoke<LinkStatus>("link_status").then(setLink).catch(() => {});
     pollLink();
     const linkTimer = setInterval(pollLink, 5000);
@@ -139,31 +175,60 @@ export default function App() {
     const unlistens = [
       listen<TransferNotification>("conduit://transfer", (ev) => applyEvent(ev.payload)),
       listen<PairingPrompt>("conduit://pairing", (ev) => setPairing(ev.payload)),
+      listen<PeerRow[]>("conduit://peers", (ev) => setPeers(ev.payload)),
       listen<{ message: string }>("conduit://error", (ev) => setLastError(ev.payload.message)),
     ];
+
+    // Native drag-and-drop: dropping files onto a peer card sends them there. The
+    // event carries physical coordinates; convert to CSS pixels to hit-test cards.
+    const dragUnlisten = getCurrentWebview().onDragDropEvent((event) => {
+      if (event.payload.type === "over") {
+        setDragging(true);
+        return;
+      }
+      setDragging(false);
+      if (event.payload.type !== "drop") return;
+
+      const { paths, position } = event.payload;
+      const scale = window.devicePixelRatio || 1;
+      const el = document.elementFromPoint(position.x / scale, position.y / scale);
+      const targetId =
+        el?.closest<HTMLElement>("[data-peer-id]")?.dataset.peerId ??
+        // No card under the cursor: an unambiguous single peer still works.
+        (peersRef.current.filter((p) => p.compatible).length === 1
+          ? peersRef.current.filter((p) => p.compatible)[0].id
+          : null);
+      if (targetId && paths.length > 0) {
+        sendPaths(targetId, paths);
+      } else if (paths.length > 0) {
+        setLastError("Drop the files onto a specific peer in the list.");
+      }
+    });
+
     return () => {
       clearInterval(linkTimer);
       for (const u of unlistens) u.then((f) => f());
+      dragUnlisten.then((f) => f());
     };
-  }, [applyEvent]);
+  }, [applyEvent, sendPaths]);
 
-  async function chooseAndSend() {
-    setLastError(null);
+  async function chooseAndSend(target: string) {
     const file = await open({ multiple: false, directory: false });
-    if (typeof file !== "string") return;
-    setSending(true);
-    try {
-      await invoke("send_to_peer", { addr: peerAddr, path: file });
-    } catch (e) {
-      setLastError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setSending(false);
-    }
+    if (typeof file === "string") sendPaths(target, [file]);
+  }
+
+  async function chooseFolderAndSend(target: string) {
+    const dir = await open({ multiple: false, directory: true });
+    if (typeof dir === "string") sendPaths(target, [dir]);
   }
 
   async function answerPairing(accept: boolean) {
     setPairing(null);
     await invoke("confirm_pairing", { accept });
+  }
+
+  function cancelTransfer(id: string) {
+    invoke("cancel_transfer", { transferId: id }).catch(() => {});
   }
 
   const transferList = orderRef.current
@@ -194,9 +259,10 @@ export default function App() {
           Thunderbolt device{link.unauthorized.length > 1 ? "s" : ""}{" "}
           <span className="font-medium">{link.unauthorized.join(", ")}</span>{" "}
           {link.unauthorized.length > 1 ? "are" : "is"} waiting for authorization.
-          Approve the connection in your OS (Linux: <code className="rounded bg-black/30 px-1">boltctl authorize</code> or
-          the desktop prompt) to unlock the fast link — transfers fall back to
-          LAN/WiFi until then.
+          Approve the connection in your OS (Linux:{" "}
+          <code className="rounded bg-black/30 px-1">boltctl authorize</code> or the
+          desktop prompt) to unlock the fast link — transfers fall back to LAN/WiFi
+          until then.
         </section>
       )}
 
@@ -208,31 +274,86 @@ export default function App() {
         </section>
       )}
 
-      {/* Send */}
+      {/* Peers */}
       <section className="rounded-xl bg-conduit-panel p-6 shadow-lg ring-1 ring-white/10">
         <h2 className="text-sm font-medium uppercase tracking-wide text-slate-400">
-          Send a file
+          Peers
         </h2>
-        <div className="mt-3 flex gap-3">
-          <input
-            value={peerAddr}
-            onChange={(e) => setPeerAddr(e.target.value)}
-            placeholder="peer address, e.g. 192.168.1.20:4433"
-            spellCheck={false}
-            className="flex-1 rounded-lg bg-black/30 px-3 py-2 font-mono text-sm text-slate-100 outline-none ring-1 ring-white/10 placeholder:text-slate-500 focus:ring-conduit-accent"
-          />
-          <button
-            onClick={chooseAndSend}
-            disabled={sending || peerAddr.trim() === ""}
-            className="rounded-lg bg-conduit-accent px-4 py-2 text-sm font-semibold text-black transition-opacity disabled:opacity-40"
-          >
-            {sending ? "Sending…" : "Choose file & send"}
-          </button>
-        </div>
-        <p className="mt-2 text-xs text-slate-500">
-          The other machine shows its address in this header. Peers appear automatically
-          once discovery lands (Phase 3).
-        </p>
+        {peers.length === 0 ? (
+          <p className="mt-3 text-sm text-slate-500">
+            Looking for peers… start Conduit on the other machine (same network or a
+            direct cable) and it appears here automatically.
+          </p>
+        ) : (
+          <ul className="mt-3 grid gap-3 sm:grid-cols-2">
+            {peers.map((p) => (
+              <li
+                key={p.id}
+                data-peer-id={p.compatible ? p.id : undefined}
+                className={`rounded-lg p-4 ring-1 transition-colors ${
+                  p.compatible
+                    ? dragging
+                      ? "bg-conduit-accent/10 ring-conduit-accent"
+                      : "bg-black/20 ring-white/10"
+                    : "bg-black/10 opacity-50 ring-white/5"
+                }`}
+              >
+                <div className="flex items-baseline justify-between">
+                  <span className="font-medium text-slate-100">{p.name}</span>
+                  <span className="text-xs text-slate-500">
+                    {p.trusted ? "paired" : "not paired"}
+                  </span>
+                </div>
+                <p className="mt-0.5 font-mono text-xs text-slate-500">{p.addr}</p>
+                {p.compatible ? (
+                  <div className="mt-3 flex gap-2">
+                    <button
+                      onClick={() => chooseAndSend(p.id)}
+                      className="rounded-md bg-conduit-accent px-3 py-1.5 text-xs font-semibold text-black"
+                    >
+                      Send file
+                    </button>
+                    <button
+                      onClick={() => chooseFolderAndSend(p.id)}
+                      className="rounded-md bg-white/10 px-3 py-1.5 text-xs text-slate-200"
+                    >
+                      Send folder
+                    </button>
+                    <span className="ml-auto self-center text-[11px] text-slate-500">
+                      or drop files here
+                    </span>
+                  </div>
+                ) : (
+                  <p className="mt-3 text-xs text-amber-400/80">
+                    Different protocol version — update Conduit on both machines.
+                  </p>
+                )}
+              </li>
+            ))}
+          </ul>
+        )}
+
+        <details className="mt-4">
+          <summary className="cursor-pointer text-xs text-slate-500">
+            Connect by address (when discovery is blocked)
+          </summary>
+          <div className="mt-2 flex gap-2">
+            <input
+              value={manualAddr}
+              onChange={(e) => setManualAddr(e.target.value)}
+              placeholder="ip:port, e.g. 169.254.10.5:4433"
+              spellCheck={false}
+              className="flex-1 rounded-lg bg-black/30 px-3 py-2 font-mono text-sm text-slate-100 outline-none ring-1 ring-white/10 placeholder:text-slate-500 focus:ring-conduit-accent"
+            />
+            <button
+              onClick={() => chooseAndSend(manualAddr)}
+              disabled={manualAddr.trim() === ""}
+              className="rounded-lg bg-white/10 px-4 py-2 text-sm text-slate-200 disabled:opacity-40"
+            >
+              Send file…
+            </button>
+          </div>
+        </details>
       </section>
 
       {/* Receive info */}
@@ -242,9 +363,7 @@ export default function App() {
             Receiving
           </h2>
           <p className="mt-2 text-sm text-slate-300">
-            Always listening on{" "}
-            <code className="rounded bg-black/30 px-1 font-mono">{status.listen_addr}</code>.
-            Incoming files land in{" "}
+            Always listening. Incoming files land in{" "}
             <code className="rounded bg-black/30 px-1 font-mono">{status.inbox}</code>.
           </p>
         </section>
@@ -264,7 +383,7 @@ export default function App() {
           </h2>
           <ul className="mt-3 space-y-4">
             {transferList.map((t) => (
-              <TransferRow key={t.id} t={t} />
+              <TransferRow key={t.id} t={t} onCancel={() => cancelTransfer(t.id)} />
             ))}
           </ul>
         </section>
@@ -305,7 +424,7 @@ export default function App() {
   );
 }
 
-function TransferRow({ t }: { t: Transfer }) {
+function TransferRow({ t, onCancel }: { t: Transfer; onCancel: () => void }) {
   const pct =
     t.state === "done"
       ? 100
@@ -323,21 +442,31 @@ function TransferRow({ t }: { t: Transfer }) {
 
   return (
     <li>
-      <div className="flex items-baseline justify-between text-sm">
+      <div className="flex items-baseline justify-between gap-3 text-sm">
         <span className="truncate font-medium text-slate-100">
           <span className="mr-2 text-slate-500">{t.direction === "incoming" ? "↓" : "↑"}</span>
           {t.name}
         </span>
-        <span
-          className={
-            t.state === "failed"
-              ? "text-red-400"
-              : t.state === "done"
-                ? "text-emerald-400"
-                : "text-slate-400"
-          }
-        >
-          {stateLabel}
+        <span className="flex items-center gap-3">
+          <span
+            className={
+              t.state === "failed"
+                ? "text-red-400"
+                : t.state === "done"
+                  ? "text-emerald-400"
+                  : "text-slate-400"
+            }
+          >
+            {stateLabel}
+          </span>
+          {(t.state === "running" || t.state === "verifying") && (
+            <button
+              onClick={onCancel}
+              className="rounded bg-white/10 px-2 py-0.5 text-xs text-slate-300 hover:bg-white/20"
+            >
+              Cancel
+            </button>
+          )}
         </span>
       </div>
       <div className="mt-1.5 h-2 overflow-hidden rounded-full bg-black/40">

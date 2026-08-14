@@ -27,6 +27,7 @@ conduit-fs = { path = "crates/conduit-fs" }
 # mdns-sd lands in Phase 3, fuser/winfsp in Phase 4.
 blake3 = "1"
 dirs = "5"
+mdns-sd = "0.13"
 postcard = { version = "1", features = ["use-std"] }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
 rcgen = "0.13"

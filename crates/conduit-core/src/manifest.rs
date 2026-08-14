@@ -1,12 +1,19 @@
 //! Transfer manifests (`docs/PROTOCOL.md` §3.1).
 //!
-//! A manifest fully describes a payload before any data moves: sizes, chunking, and
-//! BLAKE3 hashes per chunk and per file. The hashes power integrity *and* resume, so
-//! building the manifest is a full read of the source — that pass is unavoidable and
-//! is done with a streaming hasher, never by loading the file into memory.
+//! A manifest fully describes a payload before any data moves: the entry tree, sizes,
+//! chunking, and BLAKE3 hashes per chunk and per file. The hashes power integrity
+//! *and* resume, so building the manifest is a full read of the source — that pass is
+//! unavoidable and is done with a streaming hasher, never by loading files into
+//! memory.
 //!
-//! Phase 1 builds single-file manifests; the `entries` vector and `Entry.path` exist
-//! so folder trees (Phase 3) extend the format without a wire change.
+//! Path convention: `Entry.path` is `/`-separated and **root-prefixed** — the first
+//! segment is always `root_name` (`"photos"`, `"photos/2024/a.jpg"`). A single-file
+//! transfer is one `File` entry whose path equals `root_name`.
+//!
+//! The transfer id is **deterministic**: the first 16 bytes of
+//! [`Manifest::content_digest`]. Re-offering the same unchanged source yields the
+//! same id, which is what lets a receiver recognize an interrupted transfer and
+//! resume it (`docs/PROTOCOL.md` §3.5) without any sender-side session state.
 
 use std::path::Path;
 
@@ -28,7 +35,7 @@ pub enum EntryKind {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
-    /// Path relative to the transfer root, always `/`-separated on the wire.
+    /// Root-prefixed, `/`-separated path — see the module docs.
     pub path: String,
     pub kind: EntryKind,
     /// Bytes; 0 for dirs.
@@ -37,7 +44,7 @@ pub struct Entry {
     pub mode: u32,
     /// BLAKE3 per chunk, in order. Empty for dirs and zero-byte files.
     pub chunk_hashes: Vec<[u8; 32]>,
-    /// BLAKE3 of the whole file contents.
+    /// BLAKE3 of the whole file contents. All-zero for dirs.
     pub file_hash: [u8; 32],
 }
 
@@ -60,9 +67,43 @@ impl Manifest {
             .sum()
     }
 
+    /// Start of each entry's slice in the **global chunk index space**: entries in
+    /// manifest order, chunks in order within each entry. This ordering is shared
+    /// with the peer — it defines the bits of `Accept.have_chunks`.
+    pub fn chunk_index_offsets(&self) -> Vec<u64> {
+        let mut offsets = Vec::with_capacity(self.entries.len());
+        let mut acc = 0u64;
+        for e in &self.entries {
+            offsets.push(acc);
+            acc += e.chunk_hashes.len() as u64;
+        }
+        offsets
+    }
+
+    /// Digest over everything except the transfer id itself. Drives the
+    /// deterministic transfer id and the receiver's resume marker: matching digests
+    /// mean "the same content, chunked the same way".
+    pub fn content_digest(&self) -> [u8; 32] {
+        let encoded = postcard::to_stdvec(&(
+            &self.root_name,
+            self.total_bytes,
+            self.chunk_size,
+            &self.entries,
+        ))
+        .expect("manifest encodes");
+        *blake3::hash(&encoded).as_bytes()
+    }
+
+    fn derived_transfer_id(&self) -> TransferId {
+        let digest = self.content_digest();
+        Uuid::from_slice(&digest[..16]).expect("16 bytes make a uuid")
+    }
+
     /// Sanity-check an inbound manifest before acting on it. Guards the receiver
     /// against a peer whose framing decoded but whose contents are inconsistent —
-    /// everything downstream (chunk math, temp-file sizing) assumes these hold.
+    /// everything downstream (chunk math, staging layout, resume scan) assumes these
+    /// hold. Path checks stop traversal attacks (`../`, absolute paths, drive
+    /// letters) before any filesystem operation is derived from a path.
     pub fn validate(&self) -> Result<()> {
         if self.chunk_size == 0 {
             return Err(Error::Protocol("manifest chunk_size is zero".into()));
@@ -70,11 +111,7 @@ impl Manifest {
         if self.entries.is_empty() {
             return Err(Error::Protocol("manifest has no entries".into()));
         }
-        if self.root_name.is_empty()
-            || self.root_name.contains(['/', '\\'])
-            || self.root_name == "."
-            || self.root_name == ".."
-        {
+        if !valid_path_component(&self.root_name) {
             return Err(Error::Protocol(format!(
                 "manifest root_name {:?} is not a plain file name",
                 self.root_name
@@ -82,12 +119,34 @@ impl Manifest {
         }
         let mut sum = 0u64;
         for (i, e) in self.entries.iter().enumerate() {
-            let expected = chunk_count(e.size, self.chunk_size);
-            if e.kind == EntryKind::File && e.chunk_hashes.len() as u64 != expected {
+            if !valid_entry_path(&self.root_name, &e.path) {
                 return Err(Error::Protocol(format!(
-                    "entry {i} declares {} chunk hashes but its size needs {expected}",
-                    e.chunk_hashes.len()
+                    "entry {i} path {:?} is not a safe root-prefixed relative path",
+                    e.path
                 )));
+            }
+            match e.kind {
+                EntryKind::File => {
+                    let expected = chunk_count(e.size, self.chunk_size);
+                    if e.chunk_hashes.len() as u64 != expected {
+                        return Err(Error::Protocol(format!(
+                            "entry {i} declares {} chunk hashes but its size needs {expected}",
+                            e.chunk_hashes.len()
+                        )));
+                    }
+                }
+                EntryKind::Dir => {
+                    if e.size != 0 || !e.chunk_hashes.is_empty() {
+                        return Err(Error::Protocol(format!(
+                            "dir entry {i} must carry no bytes or chunk hashes"
+                        )));
+                    }
+                }
+                EntryKind::Symlink => {
+                    return Err(Error::Protocol(
+                        "symlink entries are not supported in this version".into(),
+                    ));
+                }
             }
             sum += e.size;
         }
@@ -101,21 +160,42 @@ impl Manifest {
     }
 }
 
-/// Build a manifest for a single file, streaming it once to compute per-chunk and
-/// whole-file hashes. Runs the read+hash loop on the blocking pool: it is a CPU/disk
-/// bound pass over potentially many gigabytes.
-pub async fn manifest_for_file(path: &Path, chunk_size: u32) -> Result<Manifest> {
+fn valid_path_component(c: &str) -> bool {
+    !c.is_empty()
+        && c != "."
+        && c != ".."
+        && !c.contains(['/', '\\', ':'])
+}
+
+fn valid_entry_path(root: &str, path: &str) -> bool {
+    if path == root {
+        return true;
+    }
+    match path.strip_prefix(root) {
+        Some(rest) => {
+            rest.starts_with('/') && rest[1..].split('/').all(valid_path_component)
+        }
+        None => false,
+    }
+}
+
+/// Build a manifest for a file **or a directory tree**, streaming every file once to
+/// compute per-chunk and whole-file hashes. Directory walks are sorted so the same
+/// tree always produces the same manifest (and thus the same transfer id). Symlinks
+/// are skipped with a warning — carrying them is future work.
+///
+/// Runs on the blocking pool: it is a CPU/disk bound pass over potentially many
+/// gigabytes.
+pub async fn manifest_for_path(path: &Path, chunk_size: u32) -> Result<Manifest> {
     assert!(chunk_size > 0, "chunk size must be non-zero");
     let path = path.to_owned();
-    tokio::task::spawn_blocking(move || manifest_for_file_sync(&path, chunk_size))
+    tokio::task::spawn_blocking(move || manifest_for_path_sync(&path, chunk_size))
         .await
         .map_err(|e| Error::Protocol(format!("manifest task panicked: {e}")))?
 }
 
-fn manifest_for_file_sync(path: &Path, chunk_size: u32) -> Result<Manifest> {
-    use std::io::Read;
-
-    let file_name = path
+fn manifest_for_path_sync(path: &Path, chunk_size: u32) -> Result<Manifest> {
+    let root_name = path
         .file_name()
         .and_then(|n| n.to_str())
         .ok_or_else(|| {
@@ -126,22 +206,91 @@ fn manifest_for_file_sync(path: &Path, chunk_size: u32) -> Result<Manifest> {
         })?
         .to_owned();
 
-    let mut file = std::fs::File::open(path)?;
-    let meta = file.metadata()?;
-    if !meta.is_file() {
+    let meta = std::fs::metadata(path)?;
+    let mut entries = Vec::new();
+    let mut total = 0u64;
+
+    if meta.is_dir() {
+        entries.push(dir_entry(root_name.clone()));
+        walk_dir(path, &root_name, chunk_size, &mut entries, &mut total)?;
+    } else if meta.is_file() {
+        entries.push(file_entry(path, root_name.clone(), chunk_size, &mut total)?);
+    } else {
         return Err(Error::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            format!("{} is not a regular file", path.display()),
+            format!("{} is neither a regular file nor a directory", path.display()),
         )));
     }
 
+    let mut manifest = Manifest {
+        transfer_id: Uuid::nil(),
+        root_name,
+        total_bytes: total,
+        chunk_size,
+        entries,
+    };
+    manifest.transfer_id = manifest.derived_transfer_id();
+    Ok(manifest)
+}
+
+fn walk_dir(
+    dir: &Path,
+    rel_prefix: &str,
+    chunk_size: u32,
+    entries: &mut Vec<Entry>,
+    total: &mut u64,
+) -> Result<()> {
+    let mut items: Vec<_> = std::fs::read_dir(dir)?.collect::<std::io::Result<_>>()?;
+    // Sort by name for a deterministic manifest (and therefore transfer id).
+    items.sort_by_key(|e| e.file_name());
+
+    for item in items {
+        let name = match item.file_name().into_string() {
+            Ok(n) => n,
+            Err(raw) => {
+                tracing::warn!("skipping {raw:?}: not valid UTF-8");
+                continue;
+            }
+        };
+        let rel = format!("{rel_prefix}/{name}");
+        let file_type = item.file_type()?;
+        if file_type.is_symlink() {
+            tracing::warn!("skipping symlink {rel}: not supported yet");
+            continue;
+        }
+        if file_type.is_dir() {
+            entries.push(dir_entry(rel.clone()));
+            walk_dir(&item.path(), &rel, chunk_size, entries, total)?;
+        } else if file_type.is_file() {
+            entries.push(file_entry(&item.path(), rel, chunk_size, total)?);
+        }
+    }
+    Ok(())
+}
+
+fn dir_entry(path: String) -> Entry {
+    Entry {
+        path,
+        kind: EntryKind::Dir,
+        size: 0,
+        mode: 0o755,
+        chunk_hashes: Vec::new(),
+        file_hash: [0u8; 32],
+    }
+}
+
+fn file_entry(abs: &Path, rel_path: String, chunk_size: u32, total: &mut u64) -> Result<Entry> {
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(abs)?;
+    let meta = file.metadata()?;
     let mut chunk_hashes = Vec::with_capacity(chunk_count(meta.len(), chunk_size) as usize);
     let mut file_hasher = FileHasher::new();
     let mut buf = vec![0u8; chunk_size as usize];
-    let mut total: u64 = 0;
+    let mut size = 0u64;
 
     loop {
-        // Fill up to a whole chunk; short reads happen on pipes and at EOF.
+        // Fill up to a whole chunk; short reads happen at EOF.
         let mut filled = 0;
         while filled < buf.len() {
             let n = file.read(&mut buf[filled..])?;
@@ -155,27 +304,20 @@ fn manifest_for_file_sync(path: &Path, chunk_size: u32) -> Result<Manifest> {
         }
         chunk_hashes.push(hash_chunk(&buf[..filled]));
         file_hasher.update(&buf[..filled]);
-        total += filled as u64;
+        size += filled as u64;
         if filled < buf.len() {
             break;
         }
     }
 
-    let entry = Entry {
-        path: file_name.clone(),
+    *total += size;
+    Ok(Entry {
+        path: rel_path,
         kind: EntryKind::File,
-        size: total,
+        size,
         mode: unix_mode(&meta),
         chunk_hashes,
         file_hash: file_hasher.finalize(),
-    };
-
-    Ok(Manifest {
-        transfer_id: Uuid::new_v4(),
-        root_name: file_name,
-        total_bytes: total,
-        chunk_size,
-        entries: vec![entry],
     })
 }
 
@@ -202,17 +344,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn manifest_covers_the_file_and_hashes_each_chunk() {
+    async fn single_file_manifest_covers_the_file_and_hashes_each_chunk() {
         let data: Vec<u8> = (0..10_000u32).map(|i| (i % 251) as u8).collect();
         let (_dir, path) = write_temp(&data);
 
-        let m = manifest_for_file(&path, 4096).await.unwrap();
+        let m = manifest_for_path(&path, 4096).await.unwrap();
         m.validate().unwrap();
         assert_eq!(m.total_bytes, 10_000);
         assert_eq!(m.root_name, "payload.bin");
         assert_eq!(m.entries.len(), 1);
 
         let e = &m.entries[0];
+        assert_eq!(e.path, "payload.bin");
         assert_eq!(e.chunk_hashes.len(), 3);
         assert_eq!(e.chunk_hashes[0], hash_chunk(&data[..4096]));
         assert_eq!(e.chunk_hashes[2], hash_chunk(&data[8192..]));
@@ -220,17 +363,67 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn zero_byte_file_has_no_chunks_but_a_valid_hash() {
-        let (_dir, path) = write_temp(b"");
-        let m = manifest_for_file(&path, 4096).await.unwrap();
+    async fn folder_manifest_walks_the_tree_in_stable_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("photos");
+        std::fs::create_dir_all(root.join("2024")).unwrap();
+        std::fs::create_dir_all(root.join("empty")).unwrap();
+        std::fs::write(root.join("a.jpg"), b"aaaa").unwrap();
+        std::fs::write(root.join("2024/b.jpg"), b"bbbbbb").unwrap();
+        std::fs::write(root.join("2024/c.jpg"), b"").unwrap();
+
+        let m = manifest_for_path(&root, 4096).await.unwrap();
         m.validate().unwrap();
-        assert_eq!(m.total_bytes, 0);
-        assert!(m.entries[0].chunk_hashes.is_empty());
-        assert_eq!(m.entries[0].file_hash, *blake3::hash(b"").as_bytes());
+        assert_eq!(m.root_name, "photos");
+        assert_eq!(m.total_bytes, 10);
+
+        let paths: Vec<(&str, EntryKind)> = m
+            .entries
+            .iter()
+            .map(|e| (e.path.as_str(), e.kind))
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                ("photos", EntryKind::Dir),
+                ("photos/2024", EntryKind::Dir),
+                ("photos/2024/b.jpg", EntryKind::File),
+                ("photos/2024/c.jpg", EntryKind::File),
+                ("photos/a.jpg", EntryKind::File),
+                ("photos/empty", EntryKind::Dir),
+            ]
+        );
+
+        // Zero-byte file: no chunks, but a real (empty-input) hash.
+        let c = &m.entries[3];
+        assert!(c.chunk_hashes.is_empty());
+        assert_eq!(c.file_hash, *blake3::hash(b"").as_bytes());
+
+        // Rebuilding the same tree gives the same transfer id (deterministic resume key).
+        let again = manifest_for_path(&root, 4096).await.unwrap();
+        assert_eq!(m.transfer_id, again.transfer_id);
+        // A content change gives a different id.
+        std::fs::write(root.join("a.jpg"), b"AAAA").unwrap();
+        let changed = manifest_for_path(&root, 4096).await.unwrap();
+        assert_ne!(m.transfer_id, changed.transfer_id);
+    }
+
+    #[tokio::test]
+    async fn global_chunk_offsets_are_cumulative() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("data");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("one.bin"), vec![1u8; 5000]).unwrap();
+        std::fs::write(root.join("two.bin"), vec![2u8; 9000]).unwrap();
+
+        let m = manifest_for_path(&root, 4096).await.unwrap();
+        // Entries: dir(data)=0 chunks, one.bin=2 chunks, two.bin=3 chunks.
+        assert_eq!(m.chunk_index_offsets(), vec![0, 0, 2]);
+        assert_eq!(m.total_chunks(), 5);
     }
 
     #[test]
-    fn validate_rejects_inconsistent_manifests() {
+    fn validate_rejects_inconsistent_and_unsafe_manifests() {
         let good = Manifest {
             transfer_id: Uuid::new_v4(),
             root_name: "a.bin".into(),
@@ -257,7 +450,19 @@ mod tests {
 
         let mut bad = good.clone();
         bad.root_name = "../evil".into();
-        assert!(bad.validate().is_err(), "path traversal in root_name must fail");
+        assert!(bad.validate().is_err(), "traversal in root_name must fail");
+
+        let mut bad = good.clone();
+        bad.entries[0].path = "b.bin".into();
+        assert!(bad.validate().is_err(), "path outside the root must fail");
+
+        let mut bad = good.clone();
+        bad.entries[0].path = "a.bin/../../x".into();
+        assert!(bad.validate().is_err(), "dot-dot segments must fail");
+
+        let mut bad = good.clone();
+        bad.entries[0].path = "a.bin/c:\\x".into();
+        assert!(bad.validate().is_err(), "backslash/drive segments must fail");
 
         let mut bad = good;
         bad.chunk_size = 0;

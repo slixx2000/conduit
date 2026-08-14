@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "Main window: core APIs (events for transfer progress) plus the native file-picker dialog.",
   "windows": ["main"],
-  "permissions": ["core:default", "dialog:default"]
+  "permissions": ["core:default", "core:webview:default", "dialog:default"]
 }

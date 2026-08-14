@@ -5,14 +5,17 @@
 //! Business logic belongs in the crates, not here — that is what keeps the core
 //! testable headless.
 //!
-//! Phase 1 surface: the app binds a QUIC endpoint on startup and always listens.
-//! Inbound transfers land in `Downloads/Conduit`. The UI can dial a peer by address
-//! (discovery replaces typing an address in Phase 3), both directions run the TOFU
-//! pairing-code flow, and live progress streams to the frontend as events:
+//! The app binds a QUIC endpoint on startup, always listens, and announces itself
+//! over mDNS while browsing for peers — nobody types an IP. Inbound transfers land in
+//! `Downloads/Conduit`. Both directions run the TOFU pairing-code flow; outgoing
+//! sends retry on disconnect (the receiver resumes from its staged partial). Live
+//! state streams to the frontend as events:
+//!   "conduit://peers"     [{ id, name, addr, trusted, compatible }]  (full list)
 //!   "conduit://pairing"   { code, peer_name, direction }
 //!   "conduit://transfer"  { direction, event: TransferEvent }
 //!   "conduit://error"     { message }
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -22,9 +25,14 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::{mpsc, oneshot, Mutex};
 
 use conduit_core::{
-    ByeReason, ConduitEndpoint, DeviceIdentity, PeerSession, ReceiveOptions, SendOptions,
-    TransferEvent, TrustStatus, TrustStore,
+    ByeReason, ConduitEndpoint, DeviceId, DeviceIdentity, PeerSession, ReceiveOptions,
+    SendOptions, TransferEvent, TransferId, TrustStatus, TrustStore,
 };
+use conduit_discovery::{Discovery, Peer, PeerEvent};
+
+/// How often a dropped connection is redialed before an outgoing transfer gives up.
+const SEND_RETRIES: u32 = 5;
+const SEND_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Snapshot of what the backend is and what link it would use. Rendered by the
 /// window header, and useful as a smoke test that the UI↔Rust bridge works.
@@ -61,6 +69,14 @@ struct AppState {
     trust: Arc<Mutex<TrustStore>>,
     /// The one pairing prompt that may be on screen; `confirm_pairing` resolves it.
     pending_pairing: Arc<Mutex<Option<oneshot::Sender<bool>>>>,
+    /// Peers currently visible via mDNS.
+    peers: Arc<Mutex<HashMap<DeviceId, Peer>>>,
+    /// Abort handles for in-flight transfers, keyed by transfer id — how the UI's
+    /// cancel button reaches a running task. Aborting drops the QUIC connection;
+    /// the receiver keeps its staged partial, so a cancelled transfer can resume.
+    active: Arc<Mutex<HashMap<TransferId, tokio::task::AbortHandle>>>,
+    /// Keeps the mDNS advertisement alive for the app's lifetime.
+    _discovery: Discovery,
     listen_addr: SocketAddr,
     inbox: PathBuf,
     device_name: String,
@@ -112,29 +128,147 @@ fn node_status(state: State<'_, AppState>) -> NodeStatus {
     }
 }
 
-/// Dial `addr`, pair if needed, and send `path`. Progress arrives as events; the
-/// returned future resolves when the receiver acknowledged (or with the error).
+/// One row of the UI's peer list.
+#[derive(Debug, Serialize, Clone)]
+struct PeerRow {
+    id: String,
+    name: String,
+    addr: String,
+    /// Already pinned — connecting will not prompt for a code.
+    trusted: bool,
+    /// Speaks our protocol major; incompatible peers render greyed out.
+    compatible: bool,
+}
+
+async fn peer_rows(state: &AppState) -> Vec<PeerRow> {
+    let trust = state.trust.lock().await;
+    let peers = state.peers.lock().await;
+    let mut rows: Vec<PeerRow> = peers
+        .values()
+        .map(|p| PeerRow {
+            id: p.id.to_string(),
+            name: p.name.clone(),
+            addr: p.socket_addr().to_string(),
+            trusted: trust.peers().any(|(id, _)| *id == p.id),
+            compatible: p.is_compatible(),
+        })
+        .collect();
+    rows.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
+    rows
+}
+
+/// Snapshot for initial render; afterwards "conduit://peers" pushes updates.
+#[tauri::command]
+async fn peers_snapshot(state: State<'_, AppState>) -> Result<Vec<PeerRow>, String> {
+    Ok(peer_rows(&state).await)
+}
+
+/// Resolve a UI target — a discovered peer's device id, or a typed ip:port for
+/// networks where mDNS is blocked — into dial candidates, best-first.
+async fn resolve_target(state: &AppState, target: &str) -> Result<Vec<SocketAddr>, String> {
+    let target = target.trim();
+    if let Ok(addr) = target.parse::<SocketAddr>() {
+        return Ok(vec![addr]);
+    }
+    if let Ok(uuid) = target.parse::<uuid::Uuid>() {
+        if let Some(peer) = state.peers.lock().await.get(&DeviceId(uuid)) {
+            return Ok(peer.socket_addrs());
+        }
+        return Err("that peer is no longer visible on the network".into());
+    }
+    Err("expected a discovered peer or an ip:port address".into())
+}
+
+/// Start sending `path` to `target` (peer id or address). Returns as soon as the job
+/// is spawned; progress, errors, and completion arrive as events. On connection loss
+/// the job redials and re-offers — the receiver's staged partial turns that into a
+/// resume rather than a restart.
 #[tauri::command]
 async fn send_to_peer(
     app: AppHandle,
     state: State<'_, AppState>,
-    addr: String,
+    target: String,
     path: String,
 ) -> Result<(), String> {
-    let addr: SocketAddr = addr
-        .trim()
-        .parse()
-        .map_err(|_| "invalid peer address — expected ip:port, e.g. 192.168.1.20:4433".to_string())?;
+    // Validate the target once up front so a typo fails the command visibly.
+    resolve_target(&state, &target).await?;
 
-    let session = state.endpoint.connect(addr).await.map_err(|e| e.to_string())?;
-    let session = pair_with_ui(&app, session, "outgoing")
-        .await
-        .map_err(|e| e.to_string())?;
+    let active = Arc::clone(&state.active);
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let abort_slot = Arc::new(std::sync::OnceLock::new());
+        let events = forward_events(app.clone(), "outgoing", Some(Arc::clone(&abort_slot)));
 
-    let events = forward_events(app.clone(), "outgoing");
-    conduit_core::send_file(session, Path::new(&path), SendOptions::default(), events)
-        .await
-        .map_err(|e| e.to_string())
+        let task = tokio::spawn({
+            let app = app.clone();
+            async move {
+                let mut last_err: Option<String> = None;
+                for attempt in 0..=SEND_RETRIES {
+                    if attempt > 0 {
+                        tokio::time::sleep(SEND_RETRY_DELAY).await;
+                    }
+                    let state = app.state::<AppState>();
+                    // Re-resolve each attempt: the peer's address may have changed
+                    // when the link came back.
+                    let candidates = match resolve_target(&state, &target).await {
+                        Ok(a) => a,
+                        Err(_) if attempt < SEND_RETRIES => continue,
+                        Err(e) => {
+                            last_err = Some(e);
+                            break;
+                        }
+                    };
+                    let result = async {
+                        let session = state.endpoint.connect_any(&candidates).await?;
+                        let session = pair_with_ui(&app, session, "outgoing").await?;
+                        conduit_core::send_path(
+                            session,
+                            Path::new(&path),
+                            SendOptions::default(),
+                            events.clone(),
+                        )
+                        .await
+                    }
+                    .await;
+
+                    match result {
+                        Ok(()) => return,
+                        // The pairing verdict is final — never redial into a second prompt.
+                        Err(conduit_core::Error::PairingRejected) => return,
+                        Err(e @ conduit_core::Error::Connection(_)) => {
+                            last_err = Some(e.to_string());
+                            continue; // transient: redial and resume
+                        }
+                        Err(e) => {
+                            last_err = Some(e.to_string());
+                            break;
+                        }
+                    }
+                }
+                if let Some(e) = last_err {
+                    emit_error(&app, format!("send failed: {e}"));
+                }
+            }
+        });
+        let _ = abort_slot.set(task.abort_handle());
+
+        let _ = task.await;
+        // Whatever id this job registered under, it is over now.
+        active.lock().await.retain(|_, h| !h.is_finished());
+    });
+    Ok(())
+}
+
+/// Cancel a running transfer (either direction). The task is aborted, dropping the
+/// QUIC connection; the receiving side keeps its staged partial, so re-sending the
+/// same content later resumes instead of restarting.
+#[tauri::command]
+async fn cancel_transfer(state: State<'_, AppState>, transfer_id: String) -> Result<(), String> {
+    let id: TransferId = transfer_id.parse().map_err(|_| "bad transfer id".to_string())?;
+    if let Some(handle) = state.active.lock().await.remove(&id) {
+        handle.abort();
+    }
+    Ok(())
 }
 
 /// The user clicked Confirm/Reject in the pairing dialog.
@@ -168,11 +302,42 @@ fn emit_error(app: &AppHandle, message: String) {
     let _ = app.emit("conduit://error", ErrorNotification { message });
 }
 
-/// Bridge a core event channel onto the Tauri event bus.
-fn forward_events(app: AppHandle, direction: &'static str) -> mpsc::Sender<TransferEvent> {
+fn transfer_id_of(event: &TransferEvent) -> TransferId {
+    match event {
+        TransferEvent::Offered { transfer_id, .. }
+        | TransferEvent::Started { transfer_id, .. }
+        | TransferEvent::Resumed { transfer_id, .. }
+        | TransferEvent::Progress { transfer_id, .. }
+        | TransferEvent::ChunkResent { transfer_id, .. }
+        | TransferEvent::Verifying { transfer_id }
+        | TransferEvent::Completed { transfer_id, .. }
+        | TransferEvent::Failed { transfer_id, .. } => *transfer_id,
+    }
+}
+
+/// Bridge a core event channel onto the Tauri event bus. When `abort_slot` is given,
+/// the events also maintain the cancel registry: the transfer id (learned from the
+/// first event) maps to the task's abort handle until the transfer ends.
+fn forward_events(
+    app: AppHandle,
+    direction: &'static str,
+    abort_slot: Option<Arc<std::sync::OnceLock<tokio::task::AbortHandle>>>,
+) -> mpsc::Sender<TransferEvent> {
     let (tx, mut rx) = mpsc::channel::<TransferEvent>(256);
     tauri::async_runtime::spawn(async move {
         while let Some(event) = rx.recv().await {
+            let tid = transfer_id_of(&event);
+            let active = Arc::clone(&app.state::<AppState>().active);
+            match &event {
+                TransferEvent::Completed { .. } | TransferEvent::Failed { .. } => {
+                    active.lock().await.remove(&tid);
+                }
+                _ => {
+                    if let Some(handle) = abort_slot.as_ref().and_then(|s| s.get()) {
+                        active.lock().await.entry(tid).or_insert_with(|| handle.clone());
+                    }
+                }
+            }
             let _ = app.emit("conduit://transfer", TransferNotification { direction, event });
         }
     });
@@ -256,15 +421,32 @@ async fn accept_loop(app: AppHandle) {
                             return;
                         }
                     };
-                    let events = forward_events(app.clone(), "incoming");
-                    if let Err(e) =
-                        conduit_core::receive_one(session, ReceiveOptions { dest_dir: inbox }, events)
+                    // Registered for cancellation like outgoing sends; an aborted
+                    // receive keeps its staged partial for a later resume.
+                    let abort_slot = Arc::new(std::sync::OnceLock::new());
+                    let events =
+                        forward_events(app.clone(), "incoming", Some(Arc::clone(&abort_slot)));
+                    let task = tokio::spawn({
+                        let app = app.clone();
+                        async move {
+                            if let Err(e) = conduit_core::receive_one(
+                                session,
+                                ReceiveOptions { dest_dir: inbox },
+                                events,
+                            )
                             .await
-                    {
-                        // The transfer's Failed event already carries the details;
-                        // this catches pre-transfer failures too.
-                        emit_error(&app, e.to_string());
-                    }
+                            {
+                                // Connection loss is routine (sender will redial and
+                                // resume); anything else deserves a visible error on
+                                // top of the transfer's own Failed event.
+                                if !matches!(e, conduit_core::Error::Connection(_)) {
+                                    emit_error(&app, e.to_string());
+                                }
+                            }
+                        }
+                    });
+                    let _ = abort_slot.set(task.abort_handle());
+                    let _ = task.await;
                 });
             }
         }
@@ -301,15 +483,50 @@ pub fn run() {
                 )
             })?;
             let endpoint = Arc::new(endpoint);
+            let listen_addr = endpoint.local_addr()?;
+
+            // Announce ourselves and browse for peers: nobody types an IP.
+            let discovery = Discovery::start(&conduit_discovery::Announcement {
+                device_id: identity.device_id,
+                device_name: identity.device_name.clone(),
+                port: listen_addr.port(),
+                fingerprint: identity.fingerprint().short(),
+            })?;
+            let mut peer_events = discovery.subscribe(identity.device_id)?;
 
             app.manage(AppState {
-                listen_addr: endpoint.local_addr()?,
+                listen_addr,
                 endpoint,
                 trust: Arc::new(Mutex::new(trust)),
                 pending_pairing: Arc::new(Mutex::new(None)),
+                peers: Arc::new(Mutex::new(HashMap::new())),
+                active: Arc::new(Mutex::new(HashMap::new())),
+                _discovery: discovery,
                 inbox,
                 device_name: identity.device_name.clone(),
                 fingerprint_short: identity.fingerprint().short(),
+            });
+
+            // Peer pump: fold Found/Lost into the map and push the whole list — a
+            // full snapshot per change keeps the frontend trivially consistent.
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                while let Some(event) = peer_events.recv().await {
+                    let state = handle.state::<AppState>();
+                    {
+                        let mut peers = state.peers.lock().await;
+                        match event {
+                            PeerEvent::Found(p) => {
+                                peers.insert(p.id, p);
+                            }
+                            PeerEvent::Lost(id) => {
+                                peers.remove(&id);
+                            }
+                        }
+                    }
+                    let rows = peer_rows(&state).await;
+                    let _ = handle.emit("conduit://peers", rows);
+                }
             });
 
             tauri::async_runtime::spawn(accept_loop(app.handle().clone()));
@@ -319,7 +536,9 @@ pub fn run() {
             app_info,
             node_status,
             link_status,
+            peers_snapshot,
             send_to_peer,
+            cancel_transfer,
             confirm_pairing
         ])
         .run(tauri::generate_context!())

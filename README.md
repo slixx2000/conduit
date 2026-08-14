@@ -15,16 +15,18 @@ localhost or LAN with no Thunderbolt hardware.
 
 ## Status
 
-**Phase 2 (Thunderbolt/USB4 link integration) — code-complete.** Two instances pair with
-a 6-digit code (TOFU cert pinning), then transfer files over QUIC/TLS 1.3 with parallel
-streams, live progress, per-chunk + whole-file BLAKE3 verification, and automatic resend
-of corrupted chunks. `conduit-net` detects the Thunderbolt/USB4 interface (and
-unauthorized peers awaiting approval) on Linux and Windows; transfers prefer it and fall
-back to LAN/WiFi. `conduit bench` measures throughput per streams×chunk configuration.
-The on-cable acceptance run awaits two TB-linked machines — every code path is identical
-over LAN. Try it headless: `conduit receive` on one side,
-`conduit send <file> --to <addr>` on the other. See [`docs/ROADMAP.md`](docs/ROADMAP.md)
-for the phase plan and acceptance criteria.
+**Phase 3 (discovery + drop-folder UX) — complete.** Peers find each other over mDNS —
+no IP entry — and pair once with a 6-digit code (TOFU cert pinning). Files **and folder
+trees** transfer over QUIC/TLS 1.3 with parallel streams, live progress, per-chunk +
+whole-file BLAKE3 verification, and automatic resend of corrupted chunks. Interrupted
+transfers stay staged and **resume on reconnect** without re-sending verified chunks.
+In the app: drag files onto a peer card to send; transfers are cancellable.
+`conduit-net` detects the Thunderbolt/USB4 interface (and unauthorized peers awaiting
+approval); transfers prefer it and fall back to LAN/WiFi. On-cable throughput
+validation awaits two TB-linked machines — every code path is identical over LAN. Try
+it headless: `conduit receive` on one side, `conduit send <path> --peer <name>` on the
+other. See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the phase plan and acceptance
+criteria.
 
 ## Layout
 
@@ -72,9 +74,11 @@ cargo run -p conduit-cli -- doctor
 cargo run -p conduit-cli -- hash <file>
 
 # Headless end-to-end transfer (two terminals; --identity-dir lets two instances
-# share one machine, --trust skips the interactive pairing prompt for scripting)
-cargo run --release -p conduit-cli -- receive --listen 127.0.0.1:44553 --dest recv --identity-dir idA
-cargo run --release -p conduit-cli -- send <file> --to 127.0.0.1:44553 --identity-dir idB
+# share one machine, --trust skips the interactive pairing prompt for scripting).
+# The receiver announces itself over mDNS; the sender finds it by name.
+cargo run --release -p conduit-cli -- receive --dest recv --identity-dir idA
+cargo run --release -p conduit-cli -- send <file-or-folder> --peer <name> --identity-dir idB
+cargo run --release -p conduit-cli -- peers            # who is visible right now?
 
 # Throughput benchmark (receiver side, then sender side; sweep with repeated flags)
 cargo run --release -p conduit-cli -- receive --forever --trust --dest recv --identity-dir idA

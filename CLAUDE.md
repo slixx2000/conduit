@@ -20,33 +20,36 @@ normative), and `docs/ROADMAP.md` (phase order + acceptance criteria).
 
 ## Current state of the repo
 
-**Phases 0 (scaffold), 1 (transport MVP over IP), and 2 (TB/USB4 link integration, code-complete)
-are done. Phase 3 (discovery + drop-folder UX) is the next work.** The workspace builds, tests, and
-lints clean. The full transfer pipeline works over any IP link: QUIC/TLS 1.3 (`quinn` +
-`rustls`/ring) with persistent self-signed device certs, TLS-exporter-derived 6-digit pairing with
-TOFU fingerprint pinning, single-file manifests with per-chunk + whole-file BLAKE3,
-`Offer`/`Accept`/N-parallel-data-streams/`Complete`/`Ack` per `docs/PROTOCOL.md`, streamed temp-file
-writes with per-chunk verify → whole-file verify → atomic rename, and detect-and-resend on chunk
-corruption (fault-injection tested). Verified end-to-end: a 2 GiB file between two `conduit` CLI
-processes over localhost arrived byte-identical.
+**Phases 0–3 are done (2 code-complete pending cable hardware; one Phase 3 bullet deferred, see
+below). Phase 4 (virtual mounted volume) is the next work.** The workspace builds, tests, and lints
+clean.
 
-Phase 2 status: `conduit-net` does real link detection — Linux sysfs (`/sys/bus/thunderbolt` netdev
-match + `authorized == 0` scan, unit-tested against fixture trees), Windows adapter
-description/friendly-name matching ("Thunderbolt"/"USB4", virtual adapters filtered), macOS
-bridge-interface heuristic. Unauthorized TB peers surface as `ThunderboltUnauthorized`; the app
-shows an "approve the connection" banner (UI polls `link_status`) and `doctor` prints all links +
-the preferred one. `conduit bench` (against `conduit receive --forever --trust`) measures the full
-pipeline per streams×chunk combination; QUIC windows are tuned for high BDP (see
-`docs/ARCHITECTURE.md` §8 for the loopback matrix). **The cable acceptance run (two TB-linked
-laptops, throughput above WiFi) is pending hardware** — per the roadmap the IP-fallback code path is
-identical, so nothing else blocks on it.
+The pipeline: QUIC/TLS 1.3 (`quinn` + `rustls`/ring) with persistent self-signed device certs,
+TLS-exporter-derived 6-digit pairing with TOFU fingerprint pinning, manifests for files **and
+folder trees** (root-prefixed `/`-separated entry paths; deterministic transfer id = BLAKE3 of the
+manifest content) with per-chunk + whole-file BLAKE3,
+`Offer`/`Accept`/N-parallel-data-streams/`Complete`/`Ack` per `docs/PROTOCOL.md`, staging-dir
+writes with per-chunk verify → per-file verify → atomic rename, detect-and-resend on chunk
+corruption, and **scan-based resume**: interrupted transfers stay staged
+(`dest/.conduit-<id>.part/`), and a re-offer of the same content rehashes staged bytes to rebuild
+`Accept.have_chunks` — no bitmap persistence, crash-safe at any byte. All integration-tested over
+loopback (incl. an abort-mid-transfer resume test) and verified 2 GiB byte-identical between two
+CLI processes.
 
-What exists: `conduit-core` (identity/trust, wire format — postcard, length-prefixed — transport,
-transfer engine, loopback integration tests), `conduit-net` (link detection as above), the `conduit`
-CLI (`send`/`receive [--forever]`/`bench`/`version`/`doctor`/`hash`), and the Tauri app:
-always-listening endpoint, pairing dialog, pick file → send → live progress → done, inbox at
-`Downloads/Conduit`, link/authorization banner. `conduit-discovery` (mDNS, Phase 3) and
-`conduit-fs` (mount, Phase 4) are still typed stubs. CI runs on a Linux + Windows matrix (currently
+Phase 2: `conduit-net` link detection (Linux sysfs + authorization scan, Windows adapter
+descriptions, macOS bridge heuristic), authorization banner in the app, `conduit bench`, tuned QUIC
+windows (`docs/ARCHITECTURE.md` §8). Cable acceptance run still pending TB hardware.
+
+Phase 3: `conduit-discovery` advertises/browses `_conduit._tcp` via `mdns-sd` (IPv4-scoped for now
+— the endpoint binds a v4 socket; peers carry *all* advertised addresses and `connect_any` tries
+candidates best-first). The app announces on startup, peers appear/disappear live in the UI,
+drag-and-drop onto a peer card sends files/folders, transfers are cancellable (abort keeps the
+peer's staged partial → later resume), and outgoing sends auto-retry on disconnect, resuming via
+the staged state. CLI: `peers [--watch]`, `send --peer <name>`. **Deferred from Phase 3**: per-peer
+shared-folder browsing + inbox-per-peer (not in the phase's acceptance criteria; shares its
+machinery with Phase 4's `ListDir`/`ReadRange`, so build it there).
+
+`conduit-fs` (mount, Phase 4) is still a typed stub. CI runs on a Linux + Windows matrix (currently
 disabled on GitHub: private repo without Actions billing).
 
 Two things that will bite you if you don't know them:

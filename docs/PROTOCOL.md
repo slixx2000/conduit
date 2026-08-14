@@ -34,9 +34,13 @@ TXT record keys:
 
 Behavior:
 - On startup and whenever the preferred interface changes, (re)advertise on that interface.
-- Browse continuously; emit `PeerFound{id, name, addr, port, fp}` / `PeerLost{id}` to the app.
+- Browse continuously; emit `PeerFound{id, name, addrs, port, fp}` / `PeerLost{id}` to the app. A
+  peer advertises one address per interface; connect logic tries candidates best-first
+  (cable-friendly IPv4 — APIPA included — before IPv6).
 - Prefer the Thunderbolt interface (from `conduit-net`) for both advertise and connect so the cable
   peer ranks first. Never require manual IP entry.
+- Current scope: mDNS runs IPv4-only, because the QUIC endpoint binds an IPv4 socket and IPv6
+  link-local targets need zone indices to dial. Revisit when the transport goes dual-stack.
 
 ---
 
@@ -108,6 +112,20 @@ Entry {
 `chunk_hashes` powers both integrity and resume. For huge trees, the manifest may itself be streamed
 in framed pages rather than sent as one blob.
 
+Conventions (implemented in `conduit-core::manifest`):
+
+- **Paths are root-prefixed**: `Entry.path` is `/`-separated and its first segment is always
+  `root_name` (`"photos"`, `"photos/2024/a.jpg"`). A single file is one `File` entry whose path
+  equals `root_name`. Receivers must reject `..`, absolute paths, backslashes, and drive letters
+  before deriving any filesystem path.
+- **`transfer_id` is deterministic**: the first 16 bytes of the BLAKE3 of the postcard encoding of
+  `(root_name, total_bytes, chunk_size, entries)`. Re-offering the same unchanged source yields the
+  same id — that identity is what lets the receiver recognize and resume an interrupted transfer
+  with no sender-side session state.
+- **Global chunk index**: entries in manifest order, chunks in order within each entry. This is the
+  bit order of `Accept.have_chunks` and the sort key for resume bookkeeping.
+- Symlink entries are defined but not yet carried; current receivers reject them.
+
 ### 3.2 Control message flow
 
 ```
@@ -157,10 +175,17 @@ is recovered from `(entry_index, chunk_index)`, so streams need not be ordered r
 
 ### 3.5 Resume
 
-Receiver persists a small sidecar per in-flight transfer: `{transfer_id, manifest_ref, received_chunk_bitmap}`.
-On reconnect for the same `transfer_id`, the receiver sends its bitmap in `Accept.have_chunks`; the
-sender transmits only the zero bits. Completed-and-verified files are skipped entirely (their whole-file
-hash already matches).
+An in-flight transfer lives in a staging directory named by the (deterministic) transfer id —
+`dest/.conduit-<id>.part/` — holding the partial tree plus a sidecar marker with the manifest's
+content digest. On a new `Offer` whose digest matches an existing staging dir, the receiver
+**rescans the staged bytes against the manifest's chunk hashes** to rebuild the have-bitmap, sends
+it in `Accept.have_chunks`, and the sender transmits only the zero bits.
+
+No bitmap is persisted: hashing the staged data *is* the record of what arrived, so a crash at any
+moment (half-written chunks included) resumes correctly — invalid bytes fail their hash and are
+fetched again, and a zero-filled region that matches a chunk hash is correct content by definition.
+The receiver keeps the staging dir on connection loss and deletes it on protocol violations or
+failed verification (that state is suspect) and after a successful finalize.
 
 ---
 

@@ -22,10 +22,10 @@ pub mod wire;
 pub use chunk::{chunk_count, chunk_range, hash_chunk, FileHasher, DEFAULT_CHUNK_SIZE};
 pub use error::{Error, Result};
 pub use identity::{DeviceIdentity, Fingerprint, TrustStatus, TrustStore, TrustedPeer};
-pub use manifest::{manifest_for_file, Entry, EntryKind, Manifest, TransferId};
+pub use manifest::{manifest_for_path, Entry, EntryKind, Manifest, TransferId};
 pub use protocol::{Capabilities, DeviceId, Hello, PROTOCOL_VERSION};
 pub use transfer::{
-    receive_one, send_file, ReceiveOptions, SendOptions, TransferEvent, DEFAULT_STREAM_COUNT,
+    receive_one, send_path, ReceiveOptions, SendOptions, TransferEvent, DEFAULT_STREAM_COUNT,
 };
 pub use transport::{ConduitEndpoint, PeerInfo, PeerSession, Side};
 pub use wire::{ByeReason, ALPN};

@@ -98,23 +98,27 @@ pub fn description_is_thunderbolt(description: &str) -> bool {
     d.contains("thunderbolt") || d.contains("usb4")
 }
 
-/// Rank an interface's addresses and return the one peers should dial.
+/// Dial-preference rank of an address; higher is better, 0 means "never dial".
 ///
 /// IPv4 beats IPv6 because it needs no scope-id to type or advertise; a link-local
 /// 169.254.x.x is *expected* on a direct cable with no DHCP, so it is not filtered.
 /// Globally-routable v4 still outranks it for ordinary LAN adapters.
-pub fn best_address(addrs: &[IpAddr]) -> Option<IpAddr> {
-    let score = |a: &IpAddr| match a {
+pub fn address_rank(a: &IpAddr) -> u8 {
+    match a {
         IpAddr::V4(v4) if v4.is_loopback() => 0,
         IpAddr::V4(v4) if v4.is_link_local() => 2,
         IpAddr::V4(_) => 3,
         IpAddr::V6(v6) if v6.is_loopback() => 0,
         IpAddr::V6(_) => 1,
-    };
+    }
+}
+
+/// The single address peers should dial first, per [`address_rank`].
+pub fn best_address(addrs: &[IpAddr]) -> Option<IpAddr> {
     addrs
         .iter()
-        .max_by_key(|a| score(a))
-        .filter(|a| score(a) > 0)
+        .max_by_key(|a| address_rank(a))
+        .filter(|a| address_rank(a) > 0)
         .copied()
 }
 

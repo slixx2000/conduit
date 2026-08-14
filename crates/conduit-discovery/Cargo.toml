@@ -7,5 +7,9 @@ license.workspace = true
 
 [dependencies]
 conduit-core.workspace = true
+conduit-net.workspace = true
+mdns-sd.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 tracing.workspace = true
+uuid.workspace = true
