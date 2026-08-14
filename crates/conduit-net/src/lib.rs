@@ -1,93 +1,25 @@
-//! Link selection: identify the Thunderbolt/USB4 interface so the data path can use
-//! the fastest available link, and fall back to any usable interface otherwise.
+//! Link selection: enumerate every usable IP link between this machine and a peer,
+//! rank them, pick the fastest, and let the user override (`docs/Transports.md`).
 //!
-//! This crate exists so that `conduit-core` never learns what Thunderbolt is. The core
-//! is handed a [`PreferredLink`] and transfers over whatever it names — which is why
-//! the whole stack is testable over loopback and LAN with no special hardware.
+//! This crate exists so that `conduit-core` never learns what a Thunderbolt (or
+//! Ethernet, WiFi, USB-bridge) link is. The core is handed an address and transfers
+//! over whatever it names — which is why the whole stack is testable over loopback
+//! and LAN with no special hardware. A transport's only job is to *produce a usable
+//! IP interface + address* and describe it.
 //!
-//! Per-platform detection:
-//! - **Linux**: a netdev is Thunderbolt when its sysfs device node lives on the
-//!   `thunderbolt` bus (`/sys/class/net/<if>/device/subsystem` → `.../bus/thunderbolt`).
-//!   Devices on that bus with `authorized == 0` are surfaced as
-//!   [`LinkKind::ThunderboltUnauthorized`] so the app can tell the user to approve the
-//!   connection (`boltctl authorize` or the desktop's Bolt prompt).
-//! - **Windows**: adapters are classified by description/friendly name — Intel's
-//!   driver advertises "Thunderbolt(TM) Networking", Windows 11's native stack says
-//!   "USB4". Authorization prompts are owned by the OS/vendor software, so an
-//!   unauthorized peer is invisible here (no adapter appears until approved).
-//! - **macOS**: the Thunderbolt Bridge appears as `bridgeN`; membership is taken as
-//!   Thunderbolt. macOS auto-authorizes cable peers, so there is no unauthorized
-//!   state to detect.
-//!
-//! The sysfs walkers are compiled (and unit-tested with fixture trees) on every
-//! platform; only [`detect_links`] wires them to the real filesystem, and only on
-//! Linux.
+//! Layout:
+//! - [`transport`] — the `Transport` trait, `Link`, and the ranking
+//!   [`transport::TransportManager`]; one implementation per link type.
+//! - Crate-root helpers shared by the transports and by `conduit-discovery`:
+//!   address ranking and the Linux sysfs walkers (compiled and unit-tested with
+//!   fixture trees on every platform; only the Linux probe wires them to `/sys`).
 
 use std::net::IpAddr;
 use std::path::Path;
 
-pub type Result<T> = std::result::Result<T, Error>;
+pub mod transport;
 
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    #[error("io error while probing interfaces: {0}")]
-    Io(#[from] std::io::Error),
-}
-
-/// How a candidate link is expected to perform.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum LinkKind {
-    /// Ordinary LAN/WiFi. Always usable; the graceful-degradation path.
-    Fallback,
-    /// A Thunderbolt/USB4 peer is present but the OS has not authorized it yet, so no
-    /// netdev exists. The UI must prompt the user to approve the connection rather
-    /// than silently using WiFi.
-    ThunderboltUnauthorized,
-    /// An authorized Thunderbolt/USB4 link with a live network interface.
-    Thunderbolt,
-}
-
-impl LinkKind {
-    /// Whether transfers can actually be bound to this link right now.
-    pub fn is_usable(self) -> bool {
-        matches!(self, LinkKind::Fallback | LinkKind::Thunderbolt)
-    }
-
-    /// Whether the user must take an action (authorize the device) to unlock the link.
-    pub fn needs_user_action(self) -> bool {
-        matches!(self, LinkKind::ThunderboltUnauthorized)
-    }
-}
-
-/// A candidate local address to bind transfers and mDNS advertisement to.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PreferredLink {
-    pub kind: LinkKind,
-    /// OS interface name, e.g. `thunderbolt0` / `bridge0` / a Windows adapter name.
-    /// For [`LinkKind::ThunderboltUnauthorized`] this is the Thunderbolt device name
-    /// (there is no netdev yet).
-    pub interface: String,
-    /// Best address on the interface. Unspecified (`0.0.0.0`) for unauthorized links.
-    pub addr: IpAddr,
-}
-
-/// Pick the best link from a candidate set: highest-ranked *usable* kind wins.
-///
-/// An unauthorized Thunderbolt link never wins — it cannot carry traffic — but callers
-/// should still surface it so the UI can prompt for authorization while transfers
-/// proceed over the fallback.
-pub fn select_preferred(candidates: &[PreferredLink]) -> Option<&PreferredLink> {
-    candidates
-        .iter()
-        .filter(|c| c.kind.is_usable())
-        .max_by_key(|c| c.kind)
-}
-
-/// Enumerate candidate links on this machine. Loopback is never a candidate; an empty
-/// result means "let the OS route" (bind unspecified), which is the LAN/localhost path.
-pub fn detect_links() -> Result<Vec<PreferredLink>> {
-    platform::detect()
-}
+pub use transport::{Link, SpeedTier, Transport, TransportKind, TransportManager};
 
 /// Whether an adapter description / friendly name identifies a Thunderbolt or USB4
 /// networking adapter. The strings to match come from real drivers: Intel's
@@ -134,9 +66,7 @@ pub fn sysfs_is_thunderbolt_netdev(sysfs_root: &Path, interface: &str) -> bool {
         .join(interface)
         .join("device/subsystem");
     match std::fs::read_link(&subsystem) {
-        Ok(target) => target
-            .file_name()
-            .is_some_and(|n| n == "thunderbolt"),
+        Ok(target) => target.file_name().is_some_and(|n| n == "thunderbolt"),
         Err(_) => false,
     }
 }
@@ -169,177 +99,10 @@ pub fn sysfs_unauthorized_devices(sysfs_root: &Path) -> Vec<(String, String)> {
     out
 }
 
-// ---------------------------------------------------------------------------
-// Platform probes
-// ---------------------------------------------------------------------------
-
-#[cfg(windows)]
-mod platform {
-    use super::*;
-
-    pub fn detect() -> Result<Vec<PreferredLink>> {
-        let adapters = ipconfig::get_adapters()
-            .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?;
-
-        let mut links = Vec::new();
-        for adapter in adapters {
-            if adapter.oper_status() != ipconfig::OperStatus::IfOperStatusUp {
-                continue;
-            }
-            use ipconfig::IfType;
-            // Loopback and tunnels can never be the transfer path. Thunderbolt/USB4
-            // networking presents as an ethernet-class adapter.
-            if matches!(
-                adapter.if_type(),
-                IfType::SoftwareLoopback | IfType::Tunnel
-            ) {
-                continue;
-            }
-            // Hypervisor/VPN virtual adapters carry addresses but are never the
-            // fast path to a cable peer; they'd otherwise pollute selection.
-            let desc = adapter.description().to_ascii_lowercase();
-            if ["hyper-v virtual", "vmware virtual", "virtualbox", "tap-windows"]
-                .iter()
-                .any(|v| desc.contains(v))
-            {
-                continue;
-            }
-            let Some(addr) = best_address(adapter.ip_addresses()) else {
-                continue;
-            };
-            let kind = if description_is_thunderbolt(adapter.description())
-                || description_is_thunderbolt(adapter.friendly_name())
-            {
-                LinkKind::Thunderbolt
-            } else {
-                LinkKind::Fallback
-            };
-            links.push(PreferredLink {
-                kind,
-                interface: adapter.friendly_name().to_string(),
-                addr,
-            });
-        }
-        Ok(links)
-    }
-}
-
-#[cfg(target_os = "linux")]
-mod platform {
-    use super::*;
-    use std::net::Ipv4Addr;
-    use std::path::PathBuf;
-
-    pub fn detect() -> Result<Vec<PreferredLink>> {
-        let sysfs = PathBuf::from("/sys");
-        let mut links = Vec::new();
-
-        // Group addresses by interface, then classify each interface via sysfs.
-        let mut by_iface: std::collections::BTreeMap<String, Vec<IpAddr>> = Default::default();
-        for iface in if_addrs::get_if_addrs()? {
-            if iface.is_loopback() {
-                continue;
-            }
-            by_iface.entry(iface.name.clone()).or_default().push(iface.ip());
-        }
-        for (name, addrs) in by_iface {
-            let Some(addr) = best_address(&addrs) else { continue };
-            let kind = if sysfs_is_thunderbolt_netdev(&sysfs, &name) {
-                LinkKind::Thunderbolt
-            } else {
-                LinkKind::Fallback
-            };
-            links.push(PreferredLink { kind, interface: name, addr });
-        }
-
-        // Peers waiting for authorization have no netdev yet; surface them so the app
-        // can prompt instead of silently using WiFi.
-        for (_node, name) in sysfs_unauthorized_devices(&sysfs) {
-            links.push(PreferredLink {
-                kind: LinkKind::ThunderboltUnauthorized,
-                interface: name,
-                addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-            });
-        }
-        Ok(links)
-    }
-}
-
-#[cfg(all(unix, not(target_os = "linux")))]
-mod platform {
-    use super::*;
-
-    pub fn detect() -> Result<Vec<PreferredLink>> {
-        // macOS: the Thunderbolt Bridge service is a bridge interface (bridge0 by
-        // default). Naming it Thunderbolt is a heuristic; refine with
-        // SystemConfiguration once a macOS machine is in the loop.
-        let mut by_iface: std::collections::BTreeMap<String, Vec<IpAddr>> = Default::default();
-        for iface in if_addrs::get_if_addrs()? {
-            if iface.is_loopback() {
-                continue;
-            }
-            by_iface.entry(iface.name.clone()).or_default().push(iface.ip());
-        }
-        let mut links = Vec::new();
-        for (name, addrs) in by_iface {
-            let Some(addr) = best_address(&addrs) else { continue };
-            let kind = if name.starts_with("bridge") {
-                LinkKind::Thunderbolt
-            } else {
-                LinkKind::Fallback
-            };
-            links.push(PreferredLink { kind, interface: name, addr });
-        }
-        Ok(links)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::net::{Ipv4Addr, Ipv6Addr};
-
-    fn link(kind: LinkKind, name: &str) -> PreferredLink {
-        PreferredLink {
-            kind,
-            interface: name.into(),
-            addr: IpAddr::V4(Ipv4Addr::LOCALHOST),
-        }
-    }
-
-    #[test]
-    fn thunderbolt_outranks_lan() {
-        let candidates = vec![
-            link(LinkKind::Fallback, "eth0"),
-            link(LinkKind::Thunderbolt, "thunderbolt0"),
-        ];
-        let chosen = select_preferred(&candidates).expect("a usable link");
-        assert_eq!(chosen.interface, "thunderbolt0");
-    }
-
-    #[test]
-    fn unauthorized_thunderbolt_never_wins_over_a_usable_link() {
-        let candidates = vec![
-            link(LinkKind::ThunderboltUnauthorized, "thunderbolt0"),
-            link(LinkKind::Fallback, "eth0"),
-        ];
-        let chosen = select_preferred(&candidates).expect("a usable link");
-        assert_eq!(chosen.interface, "eth0");
-    }
-
-    #[test]
-    fn unauthorized_thunderbolt_alone_yields_nothing_usable_but_flags_user_action() {
-        let candidates = vec![link(LinkKind::ThunderboltUnauthorized, "thunderbolt0")];
-        assert!(select_preferred(&candidates).is_none());
-        assert!(candidates[0].kind.needs_user_action());
-    }
-
-    #[test]
-    fn no_candidates_is_not_an_error() {
-        assert!(select_preferred(&[]).is_none());
-        // Real machines have interfaces; the probe must simply not error.
-        detect_links().expect("probe must not fail");
-    }
 
     #[test]
     fn descriptions_from_real_drivers_classify_as_thunderbolt() {
@@ -411,9 +174,8 @@ mod tests {
         #[cfg(unix)]
         std::os::unix::fs::symlink(target, link).unwrap();
         #[cfg(windows)]
-        // Directory symlinks need privileges on Windows; junctions do not, but
-        // read_link does not resolve junctions the same way. Fall back to a real
-        // symlink and skip gracefully when the privilege is missing.
+        // Directory symlinks need privileges on Windows; skip gracefully when the
+        // privilege is missing (CI runners grant it).
         if std::os::windows::fs::symlink_dir(target, link).is_err() {
             eprintln!("skipping symlink-dependent assertion: no symlink privilege");
         }
@@ -425,8 +187,6 @@ mod tests {
         fake.add_netdev("thunderbolt0", "thunderbolt");
         fake.add_netdev("eth0", "pci");
 
-        // Only assert when the symlink was actually created (Windows CI runners
-        // grant the privilege; a local non-admin shell may not).
         if fake
             .root()
             .join("class/net/thunderbolt0/device/subsystem")
@@ -444,7 +204,7 @@ mod tests {
         let fake = FakeSysfs::new();
         fake.add_tb_device("0-1", "0", Some("Peer Laptop"));
         fake.add_tb_device("0-2", "1", Some("Dock"));
-        fake.add_tb_device("domain0", "", None); // no authorized file content → skipped
+        fake.add_tb_device("domain0", "", None); // empty authorized file → skipped
 
         let unauthorized = sysfs_unauthorized_devices(fake.root());
         assert_eq!(
@@ -457,5 +217,17 @@ mod tests {
     fn sysfs_unauthorized_scan_of_missing_tree_is_empty() {
         let fake = FakeSysfs::new();
         assert!(sysfs_unauthorized_devices(fake.root()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn manager_probes_this_machine_without_failing() {
+        let mgr = TransportManager::with_defaults();
+        let links = mgr.available().await;
+        // Contents are machine-dependent; the invariants are "no panic, no
+        // loopback, ranked output".
+        for l in &links {
+            assert!(!l.bind_addr.is_loopback() || l.needs_authorization);
+        }
+        let _ = mgr.preferred().await;
     }
 }

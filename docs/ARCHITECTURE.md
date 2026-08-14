@@ -206,6 +206,16 @@ Resolved:
   16 MiB/stream receive window (a stream must hold ≥1 whole chunk in flight), 256 MiB
   connection receive/send windows.
 
+- **Pluggable transports (`docs/Transports.md`) — implemented.** `conduit-net` exposes a
+  `Transport` trait + `TransportManager` (Thunderbolt/USB4, Ethernet, WiFi, USB bridge cables),
+  ranking links `(direct, speed_tier, base_priority)` descending. Direct = no default gateway +
+  link-local-only addressing. One deliberate deviation from that doc: the QUIC endpoint keeps
+  binding the **wildcard** address instead of `Link.bind_addr` — a specific-address bind would die
+  with its link, whereas wildcard + the app's redial loop + scan-based resume give the "active link
+  disappears → fall back and resume" behavior for free. The active link therefore drives ranking,
+  discovery preference, and the UI's Connection panel (with manual override), not the socket bind;
+  revisit if interface-scoped binding is ever needed for isolation.
+
 Still open:
 
 - QUIC (`quinn`) vs parallel TLS-over-TCP: default to QUIC; if profiling shows userspace QUIC is

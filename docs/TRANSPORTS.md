@@ -1,6 +1,17 @@
 # TRANSPORTS.md — Pluggable link layer for Conduit
 
-**Status:** additive to the current build (Claude Code is on Phase 3). This introduces a transport
+**Status: implemented** (`conduit-net/src/transport/`), with the deviations recorded in
+`ARCHITECTURE.md` §8: the endpoint stays bound to the wildcard address (so a mid-session link change
+falls back without a rebind — the send retry + scan-based resume absorb the interruption) and the
+active link drives ranking/UI rather than the literal socket bind; mDNS remains IPv4-scoped until
+the transport goes dual-stack; macOS wired/wireless classification is name-heuristic until
+SystemConfiguration probing lands. A CDC/RNDIS device *with a gateway* (e.g. a phone tethered for
+internet) is classified as a shared-network "USB network device", not a bridge cable — only
+gateway-less link-local CDC links count as direct. Hardware-dependent acceptance items (two-laptop
+direct Ethernet, real bridge cable, Thunderbolt cable) remain pending test hardware; everything is
+exercised over LAN/loopback plus unit fixtures.
+
+This introduces a transport
 abstraction so Conduit runs on **any** link between two laptops, not only Thunderbolt/USB4. It is
 **non-breaking**: the existing QUIC/TLS session, protocol, and transfer engine are unchanged — this
 only generalizes *how the preferred IP link is chosen*. Read after `ARCHITECTURE.md` and `PROTOCOL.md`.

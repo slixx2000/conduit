@@ -36,9 +36,17 @@ corruption, and **scan-based resume**: interrupted transfers stay staged
 loopback (incl. an abort-mid-transfer resume test) and verified 2 GiB byte-identical between two
 CLI processes.
 
-Phase 2: `conduit-net` link detection (Linux sysfs + authorization scan, Windows adapter
-descriptions, macOS bridge heuristic), authorization banner in the app, `conduit bench`, tuned QUIC
-windows (`docs/ARCHITECTURE.md` §8). Cable acceptance run still pending TB hardware.
+Phase 2 + `docs/Transports.md`: `conduit-net` is a **pluggable link layer** — a `Transport` trait
+with Thunderbolt/USB4, Ethernet (direct-cable vs LAN via the no-gateway + link-local rule), WiFi,
+and USB-bridge (CDC-NCM/RNDIS; tethers with a gateway are classified as shared "USB network
+device") implementations, aggregated and ranked `(direct, speed_tier, base_priority)` by
+`TransportManager` (Linux probing is sysfs/fixture-unit-tested on all platforms; Windows uses
+adapter metadata). The app's Connection panel shows all links with the active one and a manual
+override (`link_status`/`set_link_override`); `doctor` prints the ranked list. The QUIC endpoint
+deliberately stays wildcard-bound (see ARCHITECTURE §8) so a dying link falls back + resumes via
+the send retry loop. Authorization banner, `conduit bench`, tuned QUIC windows as before.
+Hardware-dependent acceptance (TB cable, two-laptop direct Ethernet, real bridge cable) pending
+hardware.
 
 Phase 3: `conduit-discovery` advertises/browses `_conduit._tcp` via `mdns-sd` (IPv4-scoped for now
 — the endpoint binds a v4 socket; peers carry *all* advertised addresses and `connect_any` tries

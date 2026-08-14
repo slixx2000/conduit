@@ -21,8 +21,17 @@ type PeerRow = {
   compatible: boolean;
 };
 
-/** Mirrors `LinkStatus` in `src-tauri/src/lib.rs`. */
-type LinkStatus = { preferred: string | null; unauthorized: string[] };
+/** Mirrors `LinkRow` / `LinkStatus` in `src-tauri/src/lib.rs`. */
+type LinkRow = {
+  label: string;
+  iface: string;
+  addr: string;
+  direct: boolean;
+  needs_authorization: boolean;
+  requires_special_hw: boolean;
+  active: boolean;
+};
+type LinkStatus = { links: LinkRow[]; overridden: boolean };
 
 /** Mirrors `TransferEvent` in `conduit-core` (serde tag = "kind"). */
 type TransferEvent =
@@ -231,9 +240,17 @@ export default function App() {
     invoke("cancel_transfer", { transferId: id }).catch(() => {});
   }
 
+  function setOverride(iface: string | null) {
+    invoke("set_link_override", { iface })
+      .then(() => invoke<LinkStatus>("link_status").then(setLink).catch(() => {}))
+      .catch(() => {});
+  }
+
   const transferList = orderRef.current
     .map((id) => transfers.get(id))
     .filter((t): t is Transfer => t !== undefined);
+  const activeLink = link?.links.find((l) => l.active) ?? null;
+  const unauthorized = link?.links.filter((l) => l.needs_authorization) ?? [];
 
   return (
     <main className="flex h-full flex-col gap-6 overflow-y-auto bg-conduit-bg p-8 text-slate-200">
@@ -245,8 +262,11 @@ export default function App() {
               ? `${status.device_name} · listening on ${status.listen_addr}`
               : "starting backend…"}
           </p>
-          {link?.preferred && (
-            <p className="mt-0.5 text-xs text-conduit-accent">link: {link.preferred}</p>
+          {activeLink && (
+            <p className="mt-0.5 text-xs text-conduit-accent">
+              {activeLink.label}
+              {link?.overridden ? " · pinned" : ""}
+            </p>
           )}
         </div>
         {status && (
@@ -254,15 +274,17 @@ export default function App() {
         )}
       </header>
 
-      {link && link.unauthorized.length > 0 && (
+      {unauthorized.length > 0 && (
         <section className="rounded-xl bg-amber-950/60 p-4 text-sm text-amber-300 ring-1 ring-amber-500/30">
-          Thunderbolt device{link.unauthorized.length > 1 ? "s" : ""}{" "}
-          <span className="font-medium">{link.unauthorized.join(", ")}</span>{" "}
-          {link.unauthorized.length > 1 ? "are" : "is"} waiting for authorization.
-          Approve the connection in your OS (Linux:{" "}
+          Thunderbolt device{unauthorized.length > 1 ? "s" : ""}{" "}
+          <span className="font-medium">
+            {unauthorized.map((l) => l.iface).join(", ")}
+          </span>{" "}
+          {unauthorized.length > 1 ? "are" : "is"} waiting for authorization. Approve
+          the connection in your OS (Linux:{" "}
           <code className="rounded bg-black/30 px-1">boltctl authorize</code> or the
-          desktop prompt) to unlock the fast link — transfers fall back to LAN/WiFi
-          until then.
+          desktop prompt) to unlock the fast link — transfers fall back to the next
+          best link until then.
         </section>
       )}
 
@@ -355,6 +377,61 @@ export default function App() {
           </div>
         </details>
       </section>
+
+      {/* Connection */}
+      {link && link.links.length > 0 && (
+        <section className="rounded-xl bg-conduit-panel p-6 shadow-lg ring-1 ring-white/10">
+          <div className="flex items-baseline justify-between">
+            <h2 className="text-sm font-medium uppercase tracking-wide text-slate-400">
+              Connection
+            </h2>
+            {link.overridden && (
+              <button
+                onClick={() => setOverride(null)}
+                className="rounded bg-white/10 px-2 py-0.5 text-xs text-slate-300 hover:bg-white/20"
+              >
+                Auto (fastest)
+              </button>
+            )}
+          </div>
+          <ul className="mt-3 space-y-2">
+            {link.links.map((l) => (
+              <li
+                key={l.iface}
+                className={`flex items-center justify-between rounded-lg px-3 py-2 text-sm ring-1 ${
+                  l.active
+                    ? "bg-conduit-accent/10 ring-conduit-accent/60"
+                    : "bg-black/20 ring-white/10"
+                }`}
+              >
+                <span>
+                  <span className={l.active ? "text-slate-100" : "text-slate-300"}>
+                    {l.label}
+                  </span>
+                  <span className="ml-2 font-mono text-xs text-slate-500">
+                    {l.iface} · {l.addr}
+                  </span>
+                  {l.requires_special_hw && (
+                    <span className="ml-2 text-xs text-slate-500">(bridge cable)</span>
+                  )}
+                </span>
+                {l.active ? (
+                  <span className="text-xs font-medium text-conduit-accent">active</span>
+                ) : l.needs_authorization ? (
+                  <span className="text-xs text-amber-400">needs authorization</span>
+                ) : (
+                  <button
+                    onClick={() => setOverride(l.iface)}
+                    className="rounded bg-white/10 px-2 py-0.5 text-xs text-slate-300 hover:bg-white/20"
+                  >
+                    Use
+                  </button>
+                )}
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
 
       {/* Receive info */}
       {status && (

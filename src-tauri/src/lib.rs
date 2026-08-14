@@ -49,10 +49,11 @@ pub struct AppInfo {
 }
 
 #[tauri::command]
-fn app_info() -> Result<AppInfo, String> {
-    let links = conduit_net::detect_links().map_err(|e| e.to_string())?;
-    let preferred_link = conduit_net::select_preferred(&links)
-        .map(|l| format!("{} ({:?})", l.interface, l.kind));
+async fn app_info() -> Result<AppInfo, String> {
+    let preferred_link = conduit_net::TransportManager::with_defaults()
+        .preferred()
+        .await
+        .map(|l| format!("{} — {}", l.iface_name, l.label()));
 
     Ok(AppInfo {
         app_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -77,6 +78,10 @@ struct AppState {
     active: Arc<Mutex<HashMap<TransferId, tokio::task::AbortHandle>>>,
     /// Keeps the mDNS advertisement alive for the app's lifetime.
     _discovery: Discovery,
+    /// The pluggable link layer (`docs/Transports.md`).
+    transports: conduit_net::TransportManager,
+    /// User-pinned interface name; `None` = auto-select the fastest link.
+    link_override: Arc<Mutex<Option<String>>>,
     listen_addr: SocketAddr,
     inbox: PathBuf,
     device_name: String,
@@ -92,30 +97,73 @@ struct NodeStatus {
     fingerprint: String,
 }
 
-/// Live link report for the UI: which interface the data path prefers, and any
-/// Thunderbolt peer stuck waiting for OS authorization. Computed fresh per call —
-/// the UI polls it so plugging/unplugging the cable mid-session is reflected.
+/// One link in the Connection panel.
+#[derive(Debug, Serialize, Clone)]
+struct LinkRow {
+    /// e.g. "Thunderbolt / USB4 · ~20 Gbps · direct cable".
+    label: String,
+    iface: String,
+    addr: String,
+    direct: bool,
+    needs_authorization: bool,
+    requires_special_hw: bool,
+    /// The link the app is currently using (auto-selected or overridden).
+    active: bool,
+}
+
+/// Live link report for the UI: every detected link ranked best-first, the active
+/// choice marked, plus whether a manual override is in force. Computed fresh per
+/// call — the UI polls it so plugging/unplugging a cable mid-session is reflected.
 #[derive(Debug, Serialize)]
 struct LinkStatus {
-    /// e.g. "thunderbolt0 — 169.254.10.5" or None when the OS routes (loopback/LAN).
-    preferred: Option<String>,
-    /// Device names awaiting authorization; non-empty means the UI should tell the
-    /// user to approve the connection instead of silently using WiFi.
-    unauthorized: Vec<String>,
+    links: Vec<LinkRow>,
+    overridden: bool,
 }
 
 #[tauri::command]
-fn link_status() -> Result<LinkStatus, String> {
-    let links = conduit_net::detect_links().map_err(|e| e.to_string())?;
+async fn link_status(state: State<'_, AppState>) -> Result<LinkStatus, String> {
+    let links = state.transports.available().await;
+    let override_iface = state.link_override.lock().await.clone();
+
+    // The override only holds while its link is still present and usable;
+    // otherwise fall back to the automatic best choice.
+    let active_iface = override_iface
+        .as_deref()
+        .filter(|name| links.iter().any(|l| l.iface_name == *name && l.is_usable()))
+        .map(str::to_string)
+        .or_else(|| {
+            links
+                .iter()
+                .find(|l| l.is_usable())
+                .map(|l| l.iface_name.clone())
+        });
+
     Ok(LinkStatus {
-        preferred: conduit_net::select_preferred(&links)
-            .map(|l| format!("{} — {}", l.interface, l.addr)),
-        unauthorized: links
-            .iter()
-            .filter(|l| l.kind.needs_user_action())
-            .map(|l| l.interface.clone())
+        overridden: override_iface.is_some(),
+        links: links
+            .into_iter()
+            .map(|l| LinkRow {
+                label: l.label(),
+                addr: l.bind_addr.to_string(),
+                direct: l.direct,
+                needs_authorization: l.needs_authorization,
+                requires_special_hw: l.requires_special_hw,
+                active: active_iface.as_deref() == Some(l.iface_name.as_str()),
+                iface: l.iface_name,
+            })
             .collect(),
     })
+}
+
+/// Pin the active link to `iface`, or pass `None` to return to automatic
+/// (fastest-link) selection.
+#[tauri::command]
+async fn set_link_override(
+    state: State<'_, AppState>,
+    iface: Option<String>,
+) -> Result<(), String> {
+    *state.link_override.lock().await = iface;
+    Ok(())
 }
 
 #[tauri::command]
@@ -502,6 +550,8 @@ pub fn run() {
                 peers: Arc::new(Mutex::new(HashMap::new())),
                 active: Arc::new(Mutex::new(HashMap::new())),
                 _discovery: discovery,
+                transports: conduit_net::TransportManager::with_defaults(),
+                link_override: Arc::new(Mutex::new(None)),
                 inbox,
                 device_name: identity.device_name.clone(),
                 fingerprint_short: identity.fingerprint().short(),
@@ -536,6 +586,7 @@ pub fn run() {
             app_info,
             node_status,
             link_status,
+            set_link_override,
             peers_snapshot,
             send_to_peer,
             cancel_transfer,
@@ -549,16 +600,17 @@ pub fn run() {
 mod tests {
     use super::*;
 
-    #[test]
-    fn app_info_reports_the_current_protocol() {
-        let info = app_info().expect("link detection must not fail");
+    #[tokio::test]
+    async fn app_info_reports_the_current_protocol() {
+        let info = app_info().await.expect("link detection must not fail");
         assert_eq!(info.protocol_version, conduit_core::PROTOCOL_VERSION);
         assert!(info.service_type.contains("_conduit"));
     }
 
-    #[test]
-    fn app_info_serializes_for_the_ui_bridge() {
-        let json = serde_json::to_string(&app_info().unwrap()).expect("must serialize");
+    #[tokio::test]
+    async fn app_info_serializes_for_the_ui_bridge() {
+        let json =
+            serde_json::to_string(&app_info().await.unwrap()).expect("must serialize");
         assert!(json.contains("protocolVersion") || json.contains("protocol_version"));
     }
 }

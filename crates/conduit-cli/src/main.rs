@@ -127,7 +127,7 @@ async fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
 
-        Command::Doctor => doctor(),
+        Command::Doctor => doctor().await,
 
         Command::Hash { path } => match hash_file(&path) {
             Ok(hash) => {
@@ -608,31 +608,35 @@ fn host_name() -> String {
         .unwrap_or_else(|_| "conduit-device".into())
 }
 
-fn doctor() -> ExitCode {
+async fn doctor() -> ExitCode {
     println!("protocol       v{}", conduit_core::PROTOCOL_VERSION);
     println!("default chunk  {} bytes", conduit_core::DEFAULT_CHUNK_SIZE);
     println!("mount driver   {}", conduit_fs::REQUIRED_DRIVER);
 
-    match conduit_net::detect_links() {
-        Ok(links) if links.is_empty() => {
-            println!("link           none detected — falling back to OS routing (LAN/loopback)");
+    let manager = conduit_net::TransportManager::with_defaults();
+    let links = manager.available().await;
+    if links.is_empty() {
+        println!("link           none detected — falling back to OS routing (LAN/loopback)");
+        return ExitCode::SUCCESS;
+    }
+    for link in &links {
+        let mut notes = String::new();
+        if link.needs_authorization {
+            notes.push_str("  [needs authorization]");
         }
-        Ok(links) => {
-            for link in &links {
-                println!(
-                    "link           {} {:?} {}",
-                    link.interface, link.kind, link.addr
-                );
-            }
-            match conduit_net::select_preferred(&links) {
-                Some(chosen) => println!("preferred      {} ({:?})", chosen.interface, chosen.kind),
-                None => println!("preferred      none usable — check Thunderbolt authorization"),
-            }
+        if link.requires_special_hw {
+            notes.push_str("  [bridge hardware]");
         }
-        Err(e) => {
-            eprintln!("error: link detection failed: {e}");
-            return ExitCode::FAILURE;
-        }
+        println!(
+            "link           {:<20} {:<24} {}{notes}",
+            link.iface_name,
+            link.bind_addr.to_string(),
+            link.label(),
+        );
+    }
+    match manager.preferred().await {
+        Some(chosen) => println!("preferred      {} — {}", chosen.iface_name, chosen.label()),
+        None => println!("preferred      none usable — check Thunderbolt authorization"),
     }
 
     ExitCode::SUCCESS

@@ -1,17 +1,18 @@
 [package]
 name = "conduit-net"
-description = "Thunderbolt/USB4 interface detection and preferred-address selection."
+description = "Pluggable link layer: enumerate, rank, and select the IP link Conduit transfers over."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-thiserror.workspace = true
+anyhow = "1"
+async-trait = "0.1"
 tracing.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-# GetAdaptersAddresses wrapper: adapter descriptions + friendly names are how a
-# Thunderbolt/USB4 networking adapter is recognized on Windows.
+# GetAdaptersAddresses wrapper: adapter descriptions, gateways, and link speeds are
+# how Windows adapters are classified into transports.
 ipconfig = "0.3"
 
 [target.'cfg(not(windows))'.dependencies]
@@ -19,3 +20,4 @@ if-addrs = "0.13"
 
 [dev-dependencies]
 tempfile = "3"
+tokio.workspace = true

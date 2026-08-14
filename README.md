@@ -21,9 +21,12 @@ trees** transfer over QUIC/TLS 1.3 with parallel streams, live progress, per-chu
 whole-file BLAKE3 verification, and automatic resend of corrupted chunks. Interrupted
 transfers stay staged and **resume on reconnect** without re-sending verified chunks.
 In the app: drag files onto a peer card to send; transfers are cancellable.
-`conduit-net` detects the Thunderbolt/USB4 interface (and unauthorized peers awaiting
-approval); transfers prefer it and fall back to LAN/WiFi. On-cable throughput
-validation awaits two TB-linked machines — every code path is identical over LAN. Try
+`conduit-net` is a pluggable link layer: it enumerates and ranks every usable link —
+Thunderbolt/USB4, direct or LAN Ethernet, WiFi, USB bridge cables — auto-selects the
+fastest (a direct cable beats a shared network), and the app's Connection panel shows
+alternatives with a manual override. A plain Ethernet cable between two laptops works
+with zero configuration via link-local addressing. On-cable throughput validation
+awaits two cable-linked machines — every code path is identical over LAN. Try
 it headless: `conduit receive` on one side, `conduit send <path> --peer <name>` on the
 other. See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the phase plan and acceptance
 criteria.
