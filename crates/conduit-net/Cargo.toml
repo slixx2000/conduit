@@ -8,3 +8,14 @@ license.workspace = true
 [dependencies]
 thiserror.workspace = true
 tracing.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# GetAdaptersAddresses wrapper: adapter descriptions + friendly names are how a
+# Thunderbolt/USB4 networking adapter is recognized on Windows.
+ipconfig = "0.3"
+
+[target.'cfg(not(windows))'.dependencies]
+if-addrs = "0.13"
+
+[dev-dependencies]
+tempfile = "3"

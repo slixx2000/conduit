@@ -195,10 +195,16 @@ Resolved:
 - **Crypto backend (Phase 1): rustls with `ring`**, not aws-lc-rs — builds on Windows without a
   cmake/NASM toolchain. Pairing codes come from the TLS exporter; fingerprints are BLAKE3-256 of
   the DER cert (the project hash everywhere).
-- **Phase 1 defaults: 4 MiB chunks, 4 parallel streams** (`DEFAULT_CHUNK_SIZE`,
-  `DEFAULT_STREAM_COUNT`). These are placeholders to be tuned empirically in Phase 2 on real
-  Thunderbolt hardware — loopback measured ~1.2 Gbps in debug-free builds with both peers and
-  BLAKE3 on one machine, which says nothing about the cable ceiling.
+- **Defaults stay at 4 MiB chunks, 4 parallel streams** (`DEFAULT_CHUNK_SIZE`,
+  `DEFAULT_STREAM_COUNT`). The Phase 2 loopback matrix (`conduit bench`, 1 GiB sparse payload,
+  release build, single Windows machine running both peers) measured 1.0–1.3 Gbit/s across
+  streams ∈ {1,2,4,8} × chunk ∈ {1,4,8} MiB with 2×8 MiB nominally best — differences within
+  ~25%, i.e. loopback is CPU-bound (TLS + BLAKE3 both directions on one box) and cannot rank
+  configurations for a real cable. Re-run `conduit bench` (against
+  `conduit receive --forever --trust`) on two TB-linked machines before changing defaults.
+  QUIC flow-control windows are sized for high BDP in `conduit-core::transport`:
+  16 MiB/stream receive window (a stream must hold ≥1 whole chunk in flight), 256 MiB
+  connection receive/send windows.
 
 Still open:
 

@@ -107,6 +107,13 @@ fn transport_config() -> Arc<quinn::TransportConfig> {
     let mut t = quinn::TransportConfig::default();
     // Keep the connection alive while a human reads the pairing code on both screens.
     t.keep_alive_interval(Some(std::time::Duration::from_secs(KEEP_ALIVE_SECS)));
+    // Flow-control windows sized for a multi-Gbps direct link. quinn's defaults
+    // (1.25 MB per stream) stall a worker mid-chunk: each data stream must keep at
+    // least one whole chunk (4 MiB default) in flight, with headroom, and the
+    // connection window must cover all parallel streams at once.
+    t.stream_receive_window(quinn::VarInt::from_u32(16 * 1024 * 1024));
+    t.receive_window(quinn::VarInt::from_u32(256 * 1024 * 1024));
+    t.send_window(256 * 1024 * 1024);
     Arc::new(t)
 }
 

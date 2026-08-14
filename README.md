@@ -15,12 +15,16 @@ localhost or LAN with no Thunderbolt hardware.
 
 ## Status
 
-**Phase 1 (transport MVP over IP) — complete.** Two instances pair with a 6-digit code
-(TOFU cert pinning), then transfer files over QUIC/TLS 1.3 with parallel streams, live
-progress, per-chunk + whole-file BLAKE3 verification, and automatic resend of corrupted
-chunks — over localhost, LAN, or (Phase 2) the Thunderbolt link. Try it headless:
-`conduit receive` on one side, `conduit send <file> --to <addr>` on the other. See
-[`docs/ROADMAP.md`](docs/ROADMAP.md) for the phase plan and acceptance criteria.
+**Phase 2 (Thunderbolt/USB4 link integration) — code-complete.** Two instances pair with
+a 6-digit code (TOFU cert pinning), then transfer files over QUIC/TLS 1.3 with parallel
+streams, live progress, per-chunk + whole-file BLAKE3 verification, and automatic resend
+of corrupted chunks. `conduit-net` detects the Thunderbolt/USB4 interface (and
+unauthorized peers awaiting approval) on Linux and Windows; transfers prefer it and fall
+back to LAN/WiFi. `conduit bench` measures throughput per streams×chunk configuration.
+The on-cable acceptance run awaits two TB-linked machines — every code path is identical
+over LAN. Try it headless: `conduit receive` on one side,
+`conduit send <file> --to <addr>` on the other. See [`docs/ROADMAP.md`](docs/ROADMAP.md)
+for the phase plan and acceptance criteria.
 
 ## Layout
 
@@ -71,6 +75,10 @@ cargo run -p conduit-cli -- hash <file>
 # share one machine, --trust skips the interactive pairing prompt for scripting)
 cargo run --release -p conduit-cli -- receive --listen 127.0.0.1:44553 --dest recv --identity-dir idA
 cargo run --release -p conduit-cli -- send <file> --to 127.0.0.1:44553 --identity-dir idB
+
+# Throughput benchmark (receiver side, then sender side; sweep with repeated flags)
+cargo run --release -p conduit-cli -- receive --forever --trust --dest recv --identity-dir idA
+cargo run --release -p conduit-cli -- bench --to <addr> --size-gib 1 --streams 2 --streams 8 --identity-dir idB --trust
 ```
 
 ## License

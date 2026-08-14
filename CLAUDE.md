@@ -20,21 +20,34 @@ normative), and `docs/ROADMAP.md` (phase order + acceptance criteria).
 
 ## Current state of the repo
 
-**Phases 0 (scaffold) and 1 (transport MVP over IP) are complete. Phase 2 is the next work.** The
-workspace builds, tests, and lints clean. The full transfer pipeline works over any IP link:
-QUIC/TLS 1.3 (`quinn` + `rustls`/ring) with persistent self-signed device certs, TLS-exporter-derived
-6-digit pairing with TOFU fingerprint pinning, single-file manifests with per-chunk + whole-file
-BLAKE3, `Offer`/`Accept`/N-parallel-data-streams/`Complete`/`Ack` per `docs/PROTOCOL.md`, streamed
-temp-file writes with per-chunk verify → whole-file verify → atomic rename, and detect-and-resend on
-chunk corruption (fault-injection tested). Verified end-to-end: a 2 GiB file between two `conduit`
-CLI processes over localhost arrived byte-identical (~1.2 Gbps loopback).
+**Phases 0 (scaffold), 1 (transport MVP over IP), and 2 (TB/USB4 link integration, code-complete)
+are done. Phase 3 (discovery + drop-folder UX) is the next work.** The workspace builds, tests, and
+lints clean. The full transfer pipeline works over any IP link: QUIC/TLS 1.3 (`quinn` +
+`rustls`/ring) with persistent self-signed device certs, TLS-exporter-derived 6-digit pairing with
+TOFU fingerprint pinning, single-file manifests with per-chunk + whole-file BLAKE3,
+`Offer`/`Accept`/N-parallel-data-streams/`Complete`/`Ack` per `docs/PROTOCOL.md`, streamed temp-file
+writes with per-chunk verify → whole-file verify → atomic rename, and detect-and-resend on chunk
+corruption (fault-injection tested). Verified end-to-end: a 2 GiB file between two `conduit` CLI
+processes over localhost arrived byte-identical.
+
+Phase 2 status: `conduit-net` does real link detection — Linux sysfs (`/sys/bus/thunderbolt` netdev
+match + `authorized == 0` scan, unit-tested against fixture trees), Windows adapter
+description/friendly-name matching ("Thunderbolt"/"USB4", virtual adapters filtered), macOS
+bridge-interface heuristic. Unauthorized TB peers surface as `ThunderboltUnauthorized`; the app
+shows an "approve the connection" banner (UI polls `link_status`) and `doctor` prints all links +
+the preferred one. `conduit bench` (against `conduit receive --forever --trust`) measures the full
+pipeline per streams×chunk combination; QUIC windows are tuned for high BDP (see
+`docs/ARCHITECTURE.md` §8 for the loopback matrix). **The cable acceptance run (two TB-linked
+laptops, throughput above WiFi) is pending hardware** — per the roadmap the IP-fallback code path is
+identical, so nothing else blocks on it.
 
 What exists: `conduit-core` (identity/trust, wire format — postcard, length-prefixed — transport,
-transfer engine, loopback integration tests), the `conduit` CLI with `send`/`receive` (plus
-`version`/`doctor`/`hash`), and the Tauri app: always-listening endpoint, pairing dialog, pick file →
-send → live progress → done, inbox at `Downloads/Conduit`. `conduit-net` (TB interface detection,
-Phase 2), `conduit-discovery` (mDNS, Phase 3), and `conduit-fs` (mount, Phase 4) are still typed
-stubs. CI runs on a Linux + Windows matrix.
+transfer engine, loopback integration tests), `conduit-net` (link detection as above), the `conduit`
+CLI (`send`/`receive [--forever]`/`bench`/`version`/`doctor`/`hash`), and the Tauri app:
+always-listening endpoint, pairing dialog, pick file → send → live progress → done, inbox at
+`Downloads/Conduit`, link/authorization banner. `conduit-discovery` (mDNS, Phase 3) and
+`conduit-fs` (mount, Phase 4) are still typed stubs. CI runs on a Linux + Windows matrix (currently
+disabled on GitHub: private repo without Actions billing).
 
 Two things that will bite you if you don't know them:
 

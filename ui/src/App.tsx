@@ -34,6 +34,9 @@ type TransferEvent =
 type TransferNotification = { direction: "incoming" | "outgoing"; event: TransferEvent };
 type PairingPrompt = { code: string; peer_name: string; direction: string };
 
+/** Mirrors `LinkStatus` in `src-tauri/src/lib.rs`. */
+type LinkStatus = { preferred: string | null; unauthorized: string[] };
+
 type Transfer = {
   id: string;
   direction: "incoming" | "outgoing";
@@ -63,6 +66,7 @@ export default function App() {
   const [sending, setSending] = useState(false);
   const [lastError, setLastError] = useState<string | null>(null);
   const [pairing, setPairing] = useState<PairingPrompt | null>(null);
+  const [link, setLink] = useState<LinkStatus | null>(null);
   const [transfers, setTransfers] = useState<Map<string, Transfer>>(new Map());
   // The transfer list renders newest-first; keep insertion order for stability.
   const orderRef = useRef<string[]>([]);
@@ -126,12 +130,19 @@ export default function App() {
       .then(setStatus)
       .catch((e: unknown) => setBridgeError(e instanceof Error ? e.message : String(e)));
 
+    // Poll the link so plugging in the cable (or an authorization prompt appearing)
+    // shows up without a restart. Discovery events replace this in Phase 3.
+    const pollLink = () => invoke<LinkStatus>("link_status").then(setLink).catch(() => {});
+    pollLink();
+    const linkTimer = setInterval(pollLink, 5000);
+
     const unlistens = [
       listen<TransferNotification>("conduit://transfer", (ev) => applyEvent(ev.payload)),
       listen<PairingPrompt>("conduit://pairing", (ev) => setPairing(ev.payload)),
       listen<{ message: string }>("conduit://error", (ev) => setLastError(ev.payload.message)),
     ];
     return () => {
+      clearInterval(linkTimer);
       for (const u of unlistens) u.then((f) => f());
     };
   }, [applyEvent]);
@@ -169,11 +180,25 @@ export default function App() {
               ? `${status.device_name} · listening on ${status.listen_addr}`
               : "starting backend…"}
           </p>
+          {link?.preferred && (
+            <p className="mt-0.5 text-xs text-conduit-accent">link: {link.preferred}</p>
+          )}
         </div>
         {status && (
           <p className="font-mono text-xs text-slate-500">id {status.fingerprint}</p>
         )}
       </header>
+
+      {link && link.unauthorized.length > 0 && (
+        <section className="rounded-xl bg-amber-950/60 p-4 text-sm text-amber-300 ring-1 ring-amber-500/30">
+          Thunderbolt device{link.unauthorized.length > 1 ? "s" : ""}{" "}
+          <span className="font-medium">{link.unauthorized.join(", ")}</span>{" "}
+          {link.unauthorized.length > 1 ? "are" : "is"} waiting for authorization.
+          Approve the connection in your OS (Linux: <code className="rounded bg-black/30 px-1">boltctl authorize</code> or
+          the desktop prompt) to unlock the fast link — transfers fall back to
+          LAN/WiFi until then.
+        </section>
+      )}
 
       {bridgeError && (
         <section className="rounded-xl bg-conduit-panel p-4 text-sm text-amber-300 ring-1 ring-white/10">

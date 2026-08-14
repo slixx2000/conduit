@@ -47,6 +47,10 @@ enum Command {
         /// Directory the received file lands in.
         #[arg(long, default_value = ".")]
         dest: PathBuf,
+        /// Keep accepting transfers instead of exiting after the first. This is the
+        /// far end of `conduit bench`.
+        #[arg(long)]
+        forever: bool,
         #[command(flatten)]
         common: CommonOpts,
     },
@@ -63,6 +67,26 @@ enum Command {
         /// Chunk size in MiB.
         #[arg(long, default_value_t = 4)]
         chunk_mib: u32,
+        #[command(flatten)]
+        common: CommonOpts,
+    },
+    /// Measure end-to-end throughput against a listening peer (run
+    /// `conduit receive --forever --trust` on the far end). Sends a sparse
+    /// zero-filled file through the full pipeline — manifest hashing, TLS, chunk
+    /// verification, disk writes — once per streams x chunk-size combination.
+    Bench {
+        /// Peer address (printed by `conduit receive`).
+        #[arg(long)]
+        to: SocketAddr,
+        /// Payload size per run, in GiB.
+        #[arg(long, default_value_t = 1.0)]
+        size_gib: f64,
+        /// Stream counts to try. Repeat the flag to sweep, e.g. --streams 1 --streams 4.
+        #[arg(long, default_values_t = [conduit_core::DEFAULT_STREAM_COUNT])]
+        streams: Vec<usize>,
+        /// Chunk sizes (MiB) to try. Repeat the flag to sweep.
+        #[arg(long, default_values_t = [4u32])]
+        chunk_mib: Vec<u32>,
         #[command(flatten)]
         common: CommonOpts,
     },
@@ -106,8 +130,9 @@ async fn main() -> ExitCode {
         Command::Receive {
             listen,
             dest,
+            forever,
             common,
-        } => run(receive(listen, dest, common)).await,
+        } => run(receive(listen, dest, forever, common)).await,
 
         Command::Send {
             file,
@@ -116,6 +141,14 @@ async fn main() -> ExitCode {
             chunk_mib,
             common,
         } => run(send(file, to, streams, chunk_mib, common)).await,
+
+        Command::Bench {
+            to,
+            size_gib,
+            streams,
+            chunk_mib,
+            common,
+        } => run(bench(to, size_gib, streams, chunk_mib, common)).await,
     }
 }
 
@@ -129,33 +162,47 @@ async fn run(fut: impl std::future::Future<Output = conduit_core::Result<()>>) -
     }
 }
 
-async fn receive(listen: SocketAddr, dest: PathBuf, common: CommonOpts) -> conduit_core::Result<()> {
+async fn receive(
+    listen: SocketAddr,
+    dest: PathBuf,
+    forever: bool,
+    common: CommonOpts,
+) -> conduit_core::Result<()> {
     let (endpoint, mut store) = open_endpoint(&common, listen)?;
     println!(
         "listening on {} — run `conduit send <file> --to <this address>` on the peer",
         endpoint.local_addr()?
     );
 
-    let session = match endpoint.accept().await {
-        Some(session) => session?,
-        None => return Err(conduit_core::Error::Connection("endpoint closed".into())),
-    };
-    println!(
-        "connection from {} ({})",
-        session.peer.name,
-        session.remote_address()
-    );
+    loop {
+        let session = match endpoint.accept().await {
+            Some(session) => session?,
+            None => return Err(conduit_core::Error::Connection("endpoint closed".into())),
+        };
+        println!(
+            "connection from {} ({})",
+            session.peer.name,
+            session.remote_address()
+        );
 
-    let session = pair(session, &mut store, common.trust).await?;
+        let session = pair(session, &mut store, common.trust).await?;
 
-    let (events_tx, events_rx) = mpsc::channel(256);
-    let printer = tokio::spawn(print_events(events_rx));
-    let result = receive_one(session, ReceiveOptions { dest_dir: dest }, events_tx).await;
-    let _ = printer.await;
+        let (events_tx, events_rx) = mpsc::channel(256);
+        let printer = tokio::spawn(print_events(events_rx));
+        let result = receive_one(session, ReceiveOptions { dest_dir: dest.clone() }, events_tx).await;
+        let _ = printer.await;
 
-    let path = result?;
-    println!("received: {}", path.display());
-    Ok(())
+        match result {
+            Ok(path) => println!("received: {}", path.display()),
+            // In forever mode a failed transfer (peer vanished, hash mismatch) must
+            // not take the listener down with it.
+            Err(e) if forever => eprintln!("transfer failed: {e}"),
+            Err(e) => return Err(e),
+        }
+        if !forever {
+            return Ok(());
+        }
+    }
 }
 
 async fn send(
@@ -186,6 +233,80 @@ async fn send(
     result?;
     println!("sent: {}", file.display());
     Ok(())
+}
+
+/// Throughput matrix: one full transfer per (streams, chunk) combination. The peer
+/// runs `conduit receive --forever --trust`, so every run exercises the complete
+/// pipeline including the receiver's verification and disk writes.
+async fn bench(
+    to: SocketAddr,
+    size_gib: f64,
+    streams: Vec<usize>,
+    chunk_mib: Vec<u32>,
+    common: CommonOpts,
+) -> conduit_core::Result<()> {
+    let size_bytes = (size_gib * (1u64 << 30) as f64) as u64;
+
+    // Sparse zero file: reads cost no disk I/O, so the link and protocol are what's
+    // being measured — while hashing, TLS, and receiver-side writes stay real.
+    let dir = tempfile_dir()?;
+    let payload = dir.join(format!("bench-{size_gib}gib.bin"));
+    {
+        let f = std::fs::File::create(&payload)?;
+        f.set_len(size_bytes)?;
+    }
+
+    let (endpoint, mut store) = open_endpoint(&common, "0.0.0.0:0".parse().unwrap())?;
+    println!("benchmarking against {to} with {size_gib} GiB per run\n");
+    println!("{:<9}{:<11}{:<11}throughput", "streams", "chunk", "time");
+
+    let mut best: Option<(usize, u32, f64)> = None;
+    for &n_streams in &streams {
+        for &mib in &chunk_mib {
+            let session = endpoint.connect(to).await?;
+            let session = pair(session, &mut store, common.trust).await?;
+
+            let opts = SendOptions {
+                chunk_size: mib.max(1) * 1024 * 1024,
+                streams: n_streams,
+                corrupt_chunk_once: None,
+            };
+            // Progress must be consumed (or the engine's sends would be dropped
+            // silently anyway) but stays off the terminal during a matrix run.
+            let (events_tx, mut events_rx) = mpsc::channel(256);
+            let drain = tokio::spawn(async move { while events_rx.recv().await.is_some() {} });
+
+            let started = std::time::Instant::now();
+            let result = send_file(session, &payload, opts, events_tx).await;
+            let elapsed = started.elapsed().as_secs_f64();
+            let _ = drain.await;
+            result?;
+
+            let gbps = size_bytes as f64 * 8.0 / elapsed / 1e9;
+            println!(
+                "{:<9}{:<11}{:<11}{:.2} Gbit/s",
+                n_streams,
+                format!("{mib} MiB"),
+                format!("{elapsed:.2} s"),
+                gbps
+            );
+            if best.is_none_or(|(_, _, b)| gbps > b) {
+                best = Some((n_streams, mib, gbps));
+            }
+        }
+    }
+
+    if let Some((s, c, g)) = best {
+        println!("\nbest: {s} stream(s) x {c} MiB chunks -> {g:.2} Gbit/s");
+    }
+    let _ = std::fs::remove_file(&payload);
+    Ok(())
+}
+
+fn tempfile_dir() -> std::io::Result<PathBuf> {
+    let dir = std::env::temp_dir().join("conduit-bench");
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
 }
 
 fn open_endpoint(

@@ -76,6 +76,32 @@ struct NodeStatus {
     fingerprint: String,
 }
 
+/// Live link report for the UI: which interface the data path prefers, and any
+/// Thunderbolt peer stuck waiting for OS authorization. Computed fresh per call —
+/// the UI polls it so plugging/unplugging the cable mid-session is reflected.
+#[derive(Debug, Serialize)]
+struct LinkStatus {
+    /// e.g. "thunderbolt0 — 169.254.10.5" or None when the OS routes (loopback/LAN).
+    preferred: Option<String>,
+    /// Device names awaiting authorization; non-empty means the UI should tell the
+    /// user to approve the connection instead of silently using WiFi.
+    unauthorized: Vec<String>,
+}
+
+#[tauri::command]
+fn link_status() -> Result<LinkStatus, String> {
+    let links = conduit_net::detect_links().map_err(|e| e.to_string())?;
+    Ok(LinkStatus {
+        preferred: conduit_net::select_preferred(&links)
+            .map(|l| format!("{} — {}", l.interface, l.addr)),
+        unauthorized: links
+            .iter()
+            .filter(|l| l.kind.needs_user_action())
+            .map(|l| l.interface.clone())
+            .collect(),
+    })
+}
+
 #[tauri::command]
 fn node_status(state: State<'_, AppState>) -> NodeStatus {
     NodeStatus {
@@ -292,6 +318,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             app_info,
             node_status,
+            link_status,
             send_to_peer,
             confirm_pairing
         ])
