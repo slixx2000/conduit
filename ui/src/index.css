@@ -3,9 +3,20 @@
 /* Tailwind v4 is configured in CSS rather than a JS config file. Project tokens go
    here as they are decided; Phase 0 only needs the dark shell the app renders into. */
 @theme {
-  --color-conduit-bg: oklch(0.18 0.02 265);
-  --color-conduit-panel: oklch(0.24 0.02 265);
-  --color-conduit-accent: oklch(0.72 0.16 195);
+  /* Palette: black / white / #df2531. The panel is the accent at low opacity over
+     black, which is how the reference deck stacks its cards. */
+  --color-conduit-bg: #000000;
+  --color-conduit-panel: #14090a;
+  --color-conduit-accent: #df2531;
+
+  /* The UI's greys are written as `slate-*` throughout. Re-point the scale at
+     neutral (slightly warm) greys so nothing reads blue next to the red. */
+  --color-slate-100: #f5f3f3;
+  --color-slate-200: #e2dedf;
+  --color-slate-300: #c7c1c2;
+  --color-slate-400: #9c9394;
+  --color-slate-500: #756c6d;
+  --color-slate-600: #524b4c;
 }
 
 html,

@@ -820,7 +820,7 @@ export default function App() {
                 type="checkbox"
                 checked={settings.notifications}
                 onChange={(e) => saveSettings({ notifications: e.target.checked })}
-                className="h-4 w-4 accent-[oklch(0.72_0.16_195)]"
+                className="h-4 w-4 accent-conduit-accent"
               />
             </label>
           </div>
@@ -1061,16 +1061,22 @@ function Spark({ samples }: { samples: number[] }) {
       className="h-8 w-full"
       aria-label="Throughput over the last few seconds"
     >
-      <path d={`${line} L100,32 L0,32 Z`} fill="oklch(0.72 0.16 195 / 0.10)" />
+      <path d={`${line} L100,32 L0,32 Z`} fill="var(--color-conduit-accent)" fillOpacity={0.1} />
       <path
         d={line}
         fill="none"
-        stroke="oklch(0.72 0.16 195)"
+        stroke="var(--color-conduit-accent)"
         strokeWidth={1.5}
         strokeLinejoin="round"
         vectorEffect="non-scaling-stroke"
       />
-      <circle cx={lastX} cy={lastY} r={1.6} fill="oklch(0.72 0.16 195)" vectorEffect="non-scaling-stroke" />
+      <circle
+        cx={lastX}
+        cy={lastY}
+        r={1.6}
+        fill="var(--color-conduit-accent)"
+        vectorEffect="non-scaling-stroke"
+      />
     </svg>
   );
 }
