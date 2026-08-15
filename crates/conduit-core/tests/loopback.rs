@@ -104,9 +104,17 @@ async fn transfer_roundtrip(
     assert_eq!(alice_code, bob_code, "both ends must display the same code");
     assert_eq!(alice_code.len(), 6);
 
-    send_path(session, source, opts, send_events_tx)
-        .await
-        .expect("send must succeed");
+    // A sender failure is usually the *symptom*: the receiver errored and dropped the
+    // connection, and "connection lost" is all that reaches this side. Report the
+    // receiver's error too rather than leaving the real cause in a joined task.
+    if let Err(send_err) = send_path(session, source, opts, send_events_tx).await {
+        let recv_err = match receiver.await {
+            Ok(Err(e)) => format!("receiver failed with: {e}"),
+            Ok(Ok(path)) => format!("receiver succeeded at {}", path.display()),
+            Err(join) => format!("receiver task panicked: {join}"),
+        };
+        panic!("send must succeed: {send_err} ({recv_err})");
+    }
     let received = receiver
         .await
         .unwrap()
