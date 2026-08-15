@@ -296,6 +296,21 @@ export default function App() {
   }
 
   function setOverride(iface: string | null) {
+    // Move the selection now and reconcile with the backend's answer after: the
+    // round trip is set_link_override + a fresh probe, which is long enough for a
+    // click to feel like it did nothing.
+    setLink((prev) =>
+      prev
+        ? {
+            ...prev,
+            overridden: iface !== null,
+            links: prev.links.map((l) => ({
+              ...l,
+              active: iface === null ? l.active : l.iface === iface,
+            })),
+          }
+        : prev,
+    );
     invoke("set_link_override", { iface })
       .then(() => invoke<LinkStatus>("link_status").then(setLink).catch(() => {}))
       .catch(() => {});
