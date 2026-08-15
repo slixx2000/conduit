@@ -932,7 +932,13 @@ async fn drive_receive(
 
     ticker.abort();
     ctrl_reader.abort();
+    // Abort *and drain*: each data reader caches an open handle on the staged file it
+    // last wrote, and `abort_all` only requests cancellation — the handles close
+    // whenever those tasks get around to unwinding. On Windows, renaming a directory
+    // while any file under it is still open fails with "Access is denied" (os error
+    // 5), so `finalize` must not start until every reader has actually finished.
     readers.abort_all();
+    while readers.join_next().await.is_some() {}
 
     // One final authoritative progress line so UIs never end short of 100%.
     if result.is_ok() {
