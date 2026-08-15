@@ -17,6 +17,14 @@ use crate::{Error, Result};
 /// granularity and shrink the manifest's hash list. Tuned empirically in Phase 2.
 pub const DEFAULT_CHUNK_SIZE: u32 = 4 * 1024 * 1024;
 
+/// Largest chunk size a manifest may declare (64 MiB).
+///
+/// `chunk_size` is attacker-controlled in an inbound `Offer`, and the receiver sizes
+/// one payload buffer per data stream from it. Bounding it in `Manifest::validate`
+/// keeps a hostile peer from forcing multi-gigabyte allocations. Well above any
+/// useful real value; the default is 4 MiB.
+pub const MAX_CHUNK_SIZE: u32 = 64 * 1024 * 1024;
+
 /// Number of chunks a file of `total_bytes` occupies.
 ///
 /// A zero-byte file has zero chunks — it is still transferred (the entry and its

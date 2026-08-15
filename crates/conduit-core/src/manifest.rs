@@ -108,6 +108,16 @@ impl Manifest {
         if self.chunk_size == 0 {
             return Err(Error::Protocol("manifest chunk_size is zero".into()));
         }
+        // Bound the attacker-controlled chunk size: the receiver allocates a buffer
+        // this large per data stream, so an unbounded value is a memory-exhaustion
+        // vector from a paired-but-hostile peer.
+        if self.chunk_size > crate::chunk::MAX_CHUNK_SIZE {
+            return Err(Error::Protocol(format!(
+                "manifest chunk_size {} exceeds the {}-byte limit",
+                self.chunk_size,
+                crate::chunk::MAX_CHUNK_SIZE
+            )));
+        }
         if self.entries.is_empty() {
             return Err(Error::Protocol("manifest has no entries".into()));
         }
@@ -464,8 +474,16 @@ mod tests {
         bad.entries[0].path = "a.bin/c:\\x".into();
         assert!(bad.validate().is_err(), "backslash/drive segments must fail");
 
-        let mut bad = good;
+        let mut bad = good.clone();
         bad.chunk_size = 0;
         assert!(bad.validate().is_err(), "zero chunk size must fail");
+
+        // An oversized chunk_size is rejected even when internally consistent.
+        let mut bad = good;
+        bad.chunk_size = crate::chunk::MAX_CHUNK_SIZE + 1;
+        bad.total_bytes = 4;
+        bad.entries[0].size = 4;
+        bad.entries[0].chunk_hashes = vec![[0u8; 32]];
+        assert!(bad.validate().is_err(), "oversized chunk size must fail");
     }
 }

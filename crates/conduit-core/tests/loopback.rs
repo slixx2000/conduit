@@ -80,13 +80,13 @@ async fn transfer_roundtrip(
         let store_dir = tempfile::tempdir().unwrap();
         let mut store = TrustStore::load(store_dir.path()).unwrap();
         assert_eq!(
-            store.status(session.peer.device_id, &session.peer.fingerprint),
+            store.status(&session.peer.fingerprint),
             TrustStatus::Unknown,
             "first contact must be unknown"
         );
         code_tx.send(session.pairing_code().unwrap()).await.unwrap();
         store
-            .pin(session.peer.device_id, &session.peer.name, &session.peer.fingerprint)
+            .pin(&session.peer.fingerprint, session.peer.device_id, &session.peer.name)
             .unwrap();
         assert_eq!(session.peer.name, "Alice");
         let _ = bob_identity; // keep Bob's identity alive for the session's lifetime

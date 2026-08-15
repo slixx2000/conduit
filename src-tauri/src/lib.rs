@@ -202,12 +202,14 @@ async fn history(state: State<'_, AppState>) -> Result<Vec<HistoryEntry>, String
     Ok(state.history.lock().await.clone())
 }
 
-/// One pinned device in the trust store.
+/// One pinned device in the trust store. `fingerprint` (full hex) is the handle
+/// rename/revoke act on; `short` and `device_id` are for display.
 #[derive(Debug, Serialize)]
 struct TrustedRow {
-    id: String,
-    name: String,
     fingerprint: String,
+    short: String,
+    name: String,
+    device_id: String,
 }
 
 #[tauri::command]
@@ -215,10 +217,11 @@ async fn trusted_peers(state: State<'_, AppState>) -> Result<Vec<TrustedRow>, St
     let trust = state.trust.lock().await;
     let mut rows: Vec<TrustedRow> = trust
         .peers()
-        .map(|(id, peer)| TrustedRow {
-            id: id.to_string(),
+        .map(|(fp, peer)| TrustedRow {
+            short: fp[..8.min(fp.len())].to_string(),
+            fingerprint: fp.clone(),
             name: peer.name.clone(),
-            fingerprint: peer.fingerprint[..8.min(peer.fingerprint.len())].to_string(),
+            device_id: peer.device_id.to_string(),
         })
         .collect();
     rows.sort_by(|a, b| a.name.cmp(&b.name));
@@ -229,10 +232,9 @@ async fn trusted_peers(state: State<'_, AppState>) -> Result<Vec<TrustedRow>, St
 async fn rename_trusted(
     app: AppHandle,
     state: State<'_, AppState>,
-    peer_id: String,
+    fingerprint: String,
     name: String,
 ) -> Result<(), String> {
-    let id = DeviceId(peer_id.parse::<uuid::Uuid>().map_err(|_| "bad peer id")?);
     let name = name.trim();
     if name.is_empty() {
         return Err("the name cannot be empty".into());
@@ -241,7 +243,7 @@ async fn rename_trusted(
         .trust
         .lock()
         .await
-        .rename(id, name)
+        .rename(&fingerprint, name)
         .map_err(|e| e.to_string())?;
     let _ = app.emit("conduit://peers", peer_rows(&state).await);
     Ok(())
@@ -252,14 +254,13 @@ async fn rename_trusted(
 async fn revoke_trusted(
     app: AppHandle,
     state: State<'_, AppState>,
-    peer_id: String,
+    fingerprint: String,
 ) -> Result<(), String> {
-    let id = DeviceId(peer_id.parse::<uuid::Uuid>().map_err(|_| "bad peer id")?);
     state
         .trust
         .lock()
         .await
-        .remove(id)
+        .remove(&fingerprint)
         .map_err(|e| e.to_string())?;
     let _ = app.emit("conduit://peers", peer_rows(&state).await);
     Ok(())
@@ -397,7 +398,9 @@ async fn peer_rows(state: &AppState) -> Vec<PeerRow> {
             id: p.id.to_string(),
             name: p.name.clone(),
             addr: p.socket_addr().to_string(),
-            trusted: trust.peers().any(|(id, _)| *id == p.id),
+            // Peers advertise a short fingerprint over mDNS; the badge means "a
+            // certificate with this prefix is pinned".
+            trusted: trust.is_pinned_prefix(&p.fingerprint),
             compatible: p.is_compatible(),
             mounted: mounts.get(&p.id).map(|m| m.handle.mountpoint().to_string()),
         })
@@ -757,18 +760,11 @@ async fn pair_with_ui(
     let state = app.state::<AppState>();
     let status = {
         let trust = state.trust.lock().await;
-        trust.status(session.peer.device_id, &session.peer.fingerprint)
+        trust.status(&session.peer.fingerprint)
     };
 
     match status {
         TrustStatus::Trusted => Ok(session),
-        TrustStatus::Mismatch { pinned } => {
-            let presented = session.peer.fingerprint.hex();
-            session
-                .bye(ByeReason::Other("fingerprint mismatch".into()))
-                .await;
-            Err(conduit_core::Error::FingerprintMismatch { pinned, presented })
-        }
         TrustStatus::Unknown => {
             let code = session.pairing_code()?;
             let (tx, rx) = oneshot::channel();
@@ -790,9 +786,9 @@ async fn pair_with_ui(
             if confirmed {
                 let mut trust = state.trust.lock().await;
                 trust.pin(
+                    &session.peer.fingerprint,
                     session.peer.device_id,
                     &session.peer.name,
-                    &session.peer.fingerprint,
                 )?;
                 Ok(session)
             } else {

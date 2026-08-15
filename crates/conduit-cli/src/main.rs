@@ -639,20 +639,21 @@ async fn trusted(action: TrustedAction) -> conduit_core::Result<()> {
     let dir = identity_dir(common)?;
     let mut store = TrustStore::load(&dir)?;
 
-    // Resolve a full id or a unique prefix into the stored device id.
-    let resolve = |store: &TrustStore, needle: &str| -> conduit_core::Result<conduit_core::DeviceId> {
-        let matches: Vec<_> = store
+    // Resolve a fingerprint prefix (as shown by `list`) into the full pinned key.
+    let resolve = |store: &TrustStore, needle: &str| -> conduit_core::Result<String> {
+        let needle = needle.to_lowercase();
+        let matches: Vec<String> = store
             .peers()
-            .filter(|(id, _)| id.to_string().starts_with(needle))
-            .map(|(id, _)| *id)
+            .map(|(fp, _)| fp.clone())
+            .filter(|fp| fp.starts_with(&needle))
             .collect();
         match matches.as_slice() {
-            [one] => Ok(*one),
+            [one] => Ok(one.clone()),
             [] => Err(conduit_core::Error::Protocol(format!(
-                "no trusted device matches {needle:?} — see `conduit trusted list`"
+                "no trusted device matches fingerprint {needle:?} — see `conduit trusted list`"
             ))),
             _ => Err(conduit_core::Error::Protocol(format!(
-                "{needle:?} is ambiguous — use more of the id"
+                "{needle:?} is ambiguous — use more of the fingerprint"
             ))),
         }
     };
@@ -665,19 +666,23 @@ async fn trusted(action: TrustedAction) -> conduit_core::Result<()> {
                 return Ok(());
             }
             rows.sort_by(|a, b| a.1.name.cmp(&b.1.name));
-            for (id, peer) in rows {
-                println!("{id}  {}  fp:{}", peer.name, &peer.fingerprint[..8]);
+            for (fp, peer) in rows {
+                // Fingerprint first: it is the identity and the handle for rename/revoke.
+                println!("{}  {}  id:{}", &fp[..16], peer.name, peer.device_id);
             }
         }
         TrustedAction::Rename { id, name, .. } => {
-            let id = resolve(&store, &id)?;
-            store.rename(id, &name)?;
-            println!("renamed {id} to {name:?}");
+            let fp = resolve(&store, &id)?;
+            store.rename(&fp, &name)?;
+            println!("renamed {} to {name:?}", &fp[..16]);
         }
         TrustedAction::Revoke { id, .. } => {
-            let id = resolve(&store, &id)?;
-            store.remove(id)?;
-            println!("revoked {id} — the next connection will show a pairing code");
+            let fp = resolve(&store, &id)?;
+            store.remove(&fp)?;
+            println!(
+                "revoked {} — the next connection will show a pairing code",
+                &fp[..16]
+            );
         }
     }
     Ok(())
@@ -709,20 +714,15 @@ fn open_endpoint(
     Ok((endpoint, store))
 }
 
-/// TOFU: silently continue for pinned peers, run the 6-digit code confirmation for
-/// unknown ones, and refuse loudly when a pinned fingerprint no longer matches.
+/// TOFU: silently continue for peers whose certificate is pinned, run the 6-digit
+/// code confirmation for any unpinned certificate.
 async fn pair(
     session: PeerSession,
     store: &mut TrustStore,
     auto_trust: bool,
 ) -> conduit_core::Result<PeerSession> {
-    match store.status(session.peer.device_id, &session.peer.fingerprint) {
+    match store.status(&session.peer.fingerprint) {
         TrustStatus::Trusted => Ok(session),
-        TrustStatus::Mismatch { pinned } => {
-            let presented = session.peer.fingerprint.hex();
-            session.bye(ByeReason::Other("fingerprint mismatch".into())).await;
-            Err(conduit_core::Error::FingerprintMismatch { pinned, presented })
-        }
         TrustStatus::Unknown => {
             let code = session.pairing_code()?;
             println!("\npairing code: {} {}", &code[..3], &code[3..]);
@@ -732,9 +732,9 @@ async fn pair(
             };
             if confirmed {
                 store.pin(
+                    &session.peer.fingerprint,
                     session.peer.device_id,
                     &session.peer.name,
-                    &session.peer.fingerprint,
                 )?;
                 println!(
                     "paired with {} ({})",

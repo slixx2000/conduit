@@ -135,76 +135,88 @@ impl DeviceIdentity {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TrustedPeer {
     pub name: String,
-    /// Full lowercase hex BLAKE3-256 of the peer's DER certificate.
-    pub fingerprint: String,
+    /// The device's self-reported UUID at pairing time. **Display only** — the trust
+    /// decision keys on the certificate fingerprint (see [`TrustStore`]), never on
+    /// this value, because a peer chooses its own `device_id` in `Hello`.
+    pub device_id: DeviceId,
 }
 
 /// Outcome of checking a connection's presented certificate against the store.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrustStatus {
-    /// Pinned fingerprint matches — connect silently.
+    /// The presented certificate fingerprint is pinned — connect silently.
     Trusted,
-    /// Never seen this device: run the pairing-code flow.
+    /// This certificate has never been pinned — run the pairing-code flow.
     Unknown,
-    /// Pinned fingerprint does NOT match — treat as possible impersonation.
-    Mismatch { pinned: String },
 }
 
 /// Pinned peers, persisted as human-readable JSON so a user can audit or hand-revoke
-/// trust before the Phase 5 management UI exists.
+/// trust.
+///
+/// **Keyed by certificate fingerprint** (full lowercase-hex BLAKE3-256 of the DER
+/// cert), which is the peer's cryptographic identity — it cannot be forged without
+/// the private key. The self-reported `device_id` is deliberately *not* the key: it
+/// travels unauthenticated in `Hello`, so keying trust on it would let a peer claim
+/// another device's id to poison or lock out its pin. A device that presents a new
+/// certificate (reinstall, or an impostor) is simply `Unknown` and re-runs the
+/// pairing code — the same trust-on-first-use decision as first contact.
 #[derive(Debug)]
 pub struct TrustStore {
     path: PathBuf,
-    peers: HashMap<DeviceId, TrustedPeer>,
+    /// fingerprint-hex → peer record.
+    peers: HashMap<String, TrustedPeer>,
 }
 
 impl TrustStore {
-    /// Load from `dir/trusted.json`; an absent file is an empty store.
+    /// Load from `dir/trusted.json`; an absent or unreadable file yields an empty
+    /// store. Failing closed to "no trust" (re-pair required) is safe; the opposite
+    /// — silently trusting on a parse error — is not.
     pub fn load(dir: &Path) -> Result<Self> {
         let path = dir.join("trusted.json");
-        let peers = if path.exists() {
-            serde_json::from_slice(&std::fs::read(&path)?)
-                .map_err(|e| Error::Crypto(format!("corrupt trusted.json: {e}")))?
-        } else {
-            HashMap::new()
+        let peers = match std::fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+                tracing::warn!("ignoring unreadable trusted.json ({e}); re-pairing required");
+                HashMap::new()
+            }),
+            Err(_) => HashMap::new(),
         };
         Ok(Self { path, peers })
     }
 
-    pub fn status(&self, peer: DeviceId, presented: &Fingerprint) -> TrustStatus {
-        match self.peers.get(&peer) {
-            None => TrustStatus::Unknown,
-            Some(t) if t.fingerprint == presented.hex() => TrustStatus::Trusted,
-            Some(t) => TrustStatus::Mismatch {
-                pinned: t.fingerprint.clone(),
-            },
+    /// Trust is granted purely on the presented certificate fingerprint.
+    pub fn status(&self, presented: &Fingerprint) -> TrustStatus {
+        if self.peers.contains_key(&presented.hex()) {
+            TrustStatus::Trusted
+        } else {
+            TrustStatus::Unknown
         }
     }
 
-    /// Pin a peer after the user confirmed the pairing code. Persists immediately —
-    /// trust decisions must never be lost to a crash.
-    pub fn pin(&mut self, peer: DeviceId, name: &str, fingerprint: &Fingerprint) -> Result<()> {
+    /// Pin a peer's certificate after the user confirmed the pairing code. Persists
+    /// immediately — trust decisions must never be lost to a crash.
+    pub fn pin(&mut self, fingerprint: &Fingerprint, device_id: DeviceId, name: &str) -> Result<()> {
         self.peers.insert(
-            peer,
+            fingerprint.hex(),
             TrustedPeer {
                 name: name.to_string(),
-                fingerprint: fingerprint.hex(),
+                device_id,
             },
         );
         self.save()
     }
 
-    pub fn remove(&mut self, peer: DeviceId) -> Result<bool> {
-        let removed = self.peers.remove(&peer).is_some();
+    /// Un-pin a certificate by its full hex fingerprint.
+    pub fn remove(&mut self, fingerprint: &str) -> Result<bool> {
+        let removed = self.peers.remove(fingerprint).is_some();
         if removed {
             self.save()?;
         }
         Ok(removed)
     }
 
-    /// Give a pinned peer a new display name (the fingerprint stays untouched).
-    pub fn rename(&mut self, peer: DeviceId, name: &str) -> Result<bool> {
-        match self.peers.get_mut(&peer) {
+    /// Give a pinned peer a new display name (the pinned fingerprint is untouched).
+    pub fn rename(&mut self, fingerprint: &str, name: &str) -> Result<bool> {
+        match self.peers.get_mut(fingerprint) {
             Some(entry) => {
                 entry.name = name.to_string();
                 self.save()?;
@@ -214,8 +226,15 @@ impl TrustStore {
         }
     }
 
-    pub fn peers(&self) -> impl Iterator<Item = (&DeviceId, &TrustedPeer)> {
+    /// Iterate `(fingerprint_hex, peer)` pairs.
+    pub fn peers(&self) -> impl Iterator<Item = (&String, &TrustedPeer)> {
         self.peers.iter()
+    }
+
+    /// Whether any pinned fingerprint begins with `prefix` (peers advertise a short
+    /// fingerprint over mDNS; this backs the "already paired" badge).
+    pub fn is_pinned_prefix(&self, prefix: &str) -> bool {
+        !prefix.is_empty() && self.peers.keys().any(|fp| fp.starts_with(prefix))
     }
 
     fn save(&self) -> Result<()> {
@@ -255,41 +274,50 @@ mod tests {
     }
 
     #[test]
-    fn trust_store_pins_detects_mismatch_and_persists() {
+    fn trust_is_keyed_by_fingerprint_not_device_id() {
         let dir = tempfile::tempdir().unwrap();
         let peer = DeviceId::new_random();
         let fp = Fingerprint([7u8; 32]);
         let other = Fingerprint([8u8; 32]);
 
         let mut store = TrustStore::load(dir.path()).unwrap();
-        assert_eq!(store.status(peer, &fp), TrustStatus::Unknown);
+        assert_eq!(store.status(&fp), TrustStatus::Unknown);
 
-        store.pin(peer, "Other laptop", &fp).unwrap();
-        assert_eq!(store.status(peer, &fp), TrustStatus::Trusted);
-        assert!(matches!(
-            store.status(peer, &other),
-            TrustStatus::Mismatch { .. }
-        ));
+        store.pin(&fp, peer, "Other laptop").unwrap();
+        assert_eq!(store.status(&fp), TrustStatus::Trusted);
 
-        // A fresh load sees the same pin.
+        // A different certificate — even claiming the SAME device_id — is not
+        // trusted. This is the whole point: pins cannot be poisoned via the id.
+        assert_eq!(store.status(&other), TrustStatus::Unknown);
+        let mut poisoned = TrustStore::load(dir.path()).unwrap();
+        poisoned.pin(&other, peer, "Impostor").unwrap();
+        assert_eq!(
+            poisoned.status(&fp),
+            TrustStatus::Trusted,
+            "the genuine cert stays trusted regardless of an impostor reusing its id"
+        );
+
+        // A fresh load sees the same pin, and the short-prefix badge matches.
         let reloaded = TrustStore::load(dir.path()).unwrap();
-        assert_eq!(reloaded.status(peer, &fp), TrustStatus::Trusted);
+        assert_eq!(reloaded.status(&fp), TrustStatus::Trusted);
+        assert!(reloaded.is_pinned_prefix(&fp.short()));
+        assert!(!reloaded.is_pinned_prefix(""));
 
         let mut reloaded = reloaded;
-        assert!(reloaded.rename(peer, "Renamed laptop").unwrap());
+        assert!(reloaded.rename(&fp.hex(), "Renamed laptop").unwrap());
         assert_eq!(
-            reloaded.peers().find(|(id, _)| **id == peer).unwrap().1.name,
+            reloaded.peers().find(|(k, _)| **k == fp.hex()).unwrap().1.name,
             "Renamed laptop"
         );
         assert_eq!(
-            reloaded.status(peer, &fp),
+            reloaded.status(&fp),
             TrustStatus::Trusted,
             "renaming must not touch the pin"
         );
 
-        assert!(reloaded.remove(peer).unwrap());
-        assert_eq!(reloaded.status(peer, &fp), TrustStatus::Unknown);
-        assert!(!reloaded.rename(peer, "gone").unwrap());
+        assert!(reloaded.remove(&fp.hex()).unwrap());
+        assert_eq!(reloaded.status(&fp), TrustStatus::Unknown);
+        assert!(!reloaded.rename(&fp.hex(), "gone").unwrap());
     }
 
     #[test]

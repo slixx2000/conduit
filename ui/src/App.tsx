@@ -59,7 +59,7 @@ type TransferNotification = { direction: "incoming" | "outgoing"; event: Transfe
 type PairingPrompt = { code: string; peer_name: string; direction: string };
 
 /** Mirrors `TrustedRow` in `src-tauri/src/lib.rs`. */
-type TrustedRow = { id: string; name: string; fingerprint: string };
+type TrustedRow = { fingerprint: string; short: string; name: string; device_id: string };
 
 /** Mirrors `HistoryEntry` in `src-tauri/src/lib.rs`. */
 type HistoryEntry = {
@@ -320,19 +320,19 @@ export default function App() {
 
   async function commitRename() {
     if (!renaming) return;
-    const { id, draft } = renaming;
+    const { id: fingerprint, draft } = renaming;
     setRenaming(null);
     if (draft.trim() === "") return;
     try {
-      await invoke("rename_trusted", { peerId: id, name: draft.trim() });
+      await invoke("rename_trusted", { fingerprint, name: draft.trim() });
     } catch (e) {
       setLastError(e instanceof Error ? e.message : String(e));
     }
   }
 
-  async function revoke(id: string) {
+  async function revoke(fingerprint: string) {
     try {
-      await invoke("revoke_trusted", { peerId: id });
+      await invoke("revoke_trusted", { fingerprint });
     } catch (e) {
       setLastError(e instanceof Error ? e.message : String(e));
     }
@@ -635,15 +635,15 @@ export default function App() {
           <ul className="mt-3 space-y-2">
             {trusted.map((t) => (
               <li
-                key={t.id}
+                key={t.fingerprint}
                 className="flex items-center justify-between gap-3 rounded-lg bg-black/20 px-3 py-2 text-sm ring-1 ring-white/10"
               >
                 <span className="min-w-0 truncate">
-                  {renaming?.id === t.id ? (
+                  {renaming?.id === t.fingerprint ? (
                     <input
                       autoFocus
                       value={renaming.draft}
-                      onChange={(e) => setRenaming({ id: t.id, draft: e.target.value })}
+                      onChange={(e) => setRenaming({ id: t.fingerprint, draft: e.target.value })}
                       onKeyDown={(e) => {
                         if (e.key === "Enter") commitRename();
                         if (e.key === "Escape") setRenaming(null);
@@ -655,18 +655,18 @@ export default function App() {
                     <span className="text-slate-100">{t.name}</span>
                   )}
                   <span className="ml-2 font-mono text-xs text-slate-500">
-                    fp:{t.fingerprint}
+                    fp:{t.short}
                   </span>
                 </span>
                 <span className="flex shrink-0 gap-2">
                   <button
-                    onClick={() => setRenaming({ id: t.id, draft: t.name })}
+                    onClick={() => setRenaming({ id: t.fingerprint, draft: t.name })}
                     className="rounded bg-white/10 px-2 py-0.5 text-xs text-slate-300 hover:bg-white/20"
                   >
                     Rename
                   </button>
                   <button
-                    onClick={() => revoke(t.id)}
+                    onClick={() => revoke(t.fingerprint)}
                     className="rounded bg-red-500/20 px-2 py-0.5 text-xs text-red-300 hover:bg-red-500/30"
                     title="Forget this device — the next connection shows a pairing code again"
                   >
