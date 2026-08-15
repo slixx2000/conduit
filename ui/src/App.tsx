@@ -1061,7 +1061,7 @@ function Spark({ samples }: { samples: number[] }) {
       className="h-8 w-full"
       aria-label="Throughput over the last few seconds"
     >
-      <path d={`${line} L100,32 L0,32 Z`} fill="oklch(0.72 0.16 195 / 0.18)" />
+      <path d={`${line} L100,32 L0,32 Z`} fill="oklch(0.72 0.16 195 / 0.10)" />
       <path
         d={line}
         fill="none"
