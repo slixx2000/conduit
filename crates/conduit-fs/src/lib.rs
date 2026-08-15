@@ -6,12 +6,13 @@
 //! ([`conduit_core::FsClient`]) and whose writes spool locally and re-use the
 //! chunked transfer engine on close (`docs/PROTOCOL.md` §4).
 //!
-//! Backends: **WinFsp on Windows (implemented)**; FUSE via `fuser` on Linux and
-//! macFUSE on macOS are pending a machine to validate on — [`mount`] reports that
+//! Backends: **WinFsp on Windows** and **FUSE (`fuser`) on Linux**, both implemented;
+//! macFUSE on macOS is pending a machine to validate on — [`mount`] reports that
 //! honestly rather than pretending.
 //!
-//! The mount host runs on its own thread (the WinFsp host type is not `Send`);
-//! filesystem callbacks bridge onto the app's tokio runtime with `block_on`.
+//! The mount host runs on its own thread (the WinFsp host type is not `Send`; the
+//! FUSE session owns its fd for its whole life); filesystem callbacks bridge onto the
+//! app's tokio runtime with `block_on`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -26,7 +27,8 @@ pub enum Error {
     /// user through installing it rather than failing opaquely.
     #[error(
         "{driver} is required to mount a peer as a drive and is not installed — \
-         install it from https://winfsp.dev and try again"
+         {} and try again",
+        DRIVER_INSTALL_HINT
     )]
     DriverMissing { driver: &'static str },
 
@@ -36,7 +38,7 @@ pub enum Error {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
-    #[error("mounting is not implemented on this platform yet (FUSE port pending)")]
+    #[error("mounting is not implemented on this platform yet (macOS/macFUSE port pending)")]
     Unsupported,
 }
 
@@ -47,6 +49,15 @@ pub const REQUIRED_DRIVER: &str = if cfg!(target_os = "windows") {
     "macFUSE"
 } else {
     "FUSE"
+};
+
+/// How to get [`REQUIRED_DRIVER`] on this platform.
+pub const DRIVER_INSTALL_HINT: &str = if cfg!(target_os = "windows") {
+    "install it from https://winfsp.dev"
+} else if cfg!(target_os = "macos") {
+    "install it from https://macfuse.io"
+} else {
+    "install your distribution's fuse3 package (Debian/Ubuntu: `sudo apt install fuse3`)"
 };
 
 /// Called when a file written into the mount is complete (handle closed): the app
@@ -115,7 +126,11 @@ pub fn mount(
     {
         windows_mount::mount(client, runtime, mountpoint, options, on_write)
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    {
+        fuse_mount::mount(client, runtime, mountpoint, options, on_write)
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
     {
         let _ = (client, runtime, mountpoint, options, on_write);
         Err(Error::Unsupported)
@@ -124,6 +139,9 @@ pub fn mount(
 
 #[cfg(windows)]
 mod windows_mount;
+
+#[cfg(target_os = "linux")]
+mod fuse_mount;
 
 #[cfg(test)]
 mod tests {

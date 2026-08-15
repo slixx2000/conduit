@@ -20,15 +20,16 @@ localhost or LAN with no Thunderbolt hardware.
 *Send again / Resume*, desktop notifications, and settings (inbox location, chunk
 size, stream count) — plus an unsigned `.msi` installer from `npm run tauri build`.
 See [`docs/SETUP.md`](docs/SETUP.md) for the user guide. Remaining for a public v1:
-code-signing/notarization, Linux/macOS packages and their FUSE mount ports, and
+code-signing/notarization, the macOS package and its macFUSE mount port, and
 on-cable validation — all blocked on credentials or hardware, not code.
 
-**Phase 4 (virtual mounted volume) — complete on Windows.** A paired peer mounts as a
-real drive (`conduit mount X: --peer <name>`, or "Mount as drive" in the app): its
-shared folder appears in Explorer, reads stream over the link on demand, and files
-copied onto the drive transfer to the peer through the ordinary verified pipeline.
-FUSE (Linux) and macFUSE ports are pending hardware to validate on. Requires the
-[WinFsp](https://winfsp.dev) driver at runtime.
+**Phase 4 (virtual mounted volume) — complete on Windows and Linux.** A paired peer
+mounts as a real drive (`conduit mount X: --peer <name>` on Windows,
+`conduit mount ~/peer --peer <name>` on Linux, or "Mount as drive" in the app): its
+shared folder appears in the file manager, reads stream over the link on demand, and
+files copied onto the drive transfer to the peer through the ordinary verified
+pipeline. The macFUSE port is pending a Mac to validate on. Needs the
+[WinFsp](https://winfsp.dev) driver on Windows, or `fuse3` on Linux.
 
 **Phase 3 (discovery + drop-folder UX) — complete.** Peers find each other over mDNS —
 no IP entry — and pair once with a 6-digit code (TOFU cert pinning). Files **and folder
@@ -61,8 +62,15 @@ criteria.
 ## Development
 
 Prerequisites: Rust (stable, MSVC toolchain on Windows), Node 20+, and the platform
-webview dependencies — WebView2 (ships with Windows 11 and current Edge), or
-`libwebkit2gtk-4.1-dev` and friends on Linux (see `.github/workflows/ci.yml`).
+webview dependencies — WebView2 (ships with Windows 11 and current Edge), or on Linux:
+
+```bash
+sudo apt install libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev \
+                 libxdo-dev libssl-dev libdbus-1-dev pkg-config patchelf
+sudo apt install fuse3   # runtime only, for `conduit mount`
+```
+
+Only `src-tauri` needs those; `cargo build -p conduit-cli` works without them.
 Building on Windows additionally needs **WinFsp with its Developer feature**
 (`winget install WinFsp.WinFsp --override "/qn ADDLOCAL=ALL"`) and **LLVM** for
 libclang (`winget install LLVM.LLVM`, then set `LIBCLANG_PATH` to
@@ -104,8 +112,10 @@ cargo run --release -p conduit-cli -- send <file-or-folder> --peer <name> --iden
 cargo run --release -p conduit-cli -- peers            # who is visible right now?
 
 # Mount a peer's shared folder as a drive (peer runs `receive --forever`;
-# its --dest directory is the share). Ctrl+C unmounts.
+# its --dest directory is the share). Ctrl+C unmounts. On Linux the mount point is
+# a directory (created if missing) instead of a drive letter.
 cargo run --release -p conduit-cli -- mount X: --peer <name> --identity-dir idB
+cargo run --release -p conduit-cli -- mount ~/peer --peer <name> --identity-dir idB
 
 # Throughput benchmark (receiver side, then sender side; sweep with repeated flags)
 cargo run --release -p conduit-cli -- receive --forever --trust --dest recv --identity-dir idA

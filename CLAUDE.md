@@ -20,8 +20,9 @@ normative), and `docs/ROADMAP.md` (phase order + acceptance criteria).
 
 ## Current state of the repo
 
-**Phases 0–5 are done on Windows** (pending items are hardware/credential-bound, listed below).
-The workspace builds, tests, and lints clean.
+**Phases 0–5 are done on Windows** (pending items are hardware/credential-bound, listed below), and
+the Phase 4 mount now has a **Linux FUSE backend** verified on this machine. The workspace builds,
+tests, and lints clean.
 
 Phase 5: trusted-device management (list/rename/revoke — app section + `conduit trusted`
 subcommand + `TrustStore::rename`), persisted transfer **history** (`history.json`, capped, with
@@ -30,8 +31,8 @@ subcommand + `TrustStore::rename`), persisted transfer **history** (`history.jso
 **settings** (`settings.json`: inbox/shared dir with folder picker, chunk MiB, stream count,
 notifications) applied live to sends/receives/mounts, a user-facing guide in `docs/SETUP.md`, and
 an unsigned Windows `.msi` produced by `npm run tauri build`. **Still pending, deliberately**:
-code-signing the `.msi` and notarizing a `.dmg` (needs certificates/Apple account), `.deb`/AppImage
-and the FUSE/macFUSE mount ports (need those OSes), the Thunderbolt-cable acceptance runs (need
+code-signing the `.msi` and notarizing a `.dmg` (needs certificates/Apple account), the macFUSE
+mount port (needs a Mac), the Thunderbolt-cable acceptance runs (need
 two cable-linked machines), and SPAKE2 pairing (roadmap-optional; TOFU + exporter-bound codes
 remain the default — revisit if the threat model grows).
 
@@ -49,6 +50,19 @@ prerequisites**: WinFsp installed with its *Developer* feature (`winget install 
 bindings against the installed SDK. Every crate that produces a Windows *binary* linking
 `conduit-fs` needs the delayload build script (see `crates/conduit-cli/build.rs`).
 
+**Linux mount (`fuse_mount.rs`, `fuser` 0.18 with `default-features = false`)** is implemented and
+verified live over loopback on this machine: `conduit mount /mnt/point --to 127.0.0.1:<port>` shows
+the peer's share, a 100 MB read off the drive is hash-identical (~325 MB/s), a `cp` onto the drive
+lands on the peer intact, mkdir/rename/unlink work, and SIGINT unmounts cleanly. No build-time
+system dependency (`default-features = false` skips libfuse; mounting goes through `fusermount3`),
+so **only `/dev/fuse` + the `fuse3` package are needed at runtime** — `mount()` returns
+`DriverMissing` when `/dev/fuse` is absent. FUSE speaks inodes and the protocol speaks
+share-relative paths, so `Inodes` interns the mapping; inodes are never recycled. Deliberate parity
+with the WinFsp backend: `rmdir` is refused (there is no recursive-delete op on the wire), in-place
+overwrite of a remote file is refused (`EPERM`), and a file created inside a *subdirectory* of the
+mount still lands in the peer's share root — `WriteHandler` ships one file into the inbox and
+carries only the leaf name.
+
 The pipeline: QUIC/TLS 1.3 (`quinn` + `rustls`/ring) with persistent self-signed device certs,
 TLS-exporter-derived 6-digit pairing with TOFU fingerprint pinning, manifests for files **and
 folder trees** (root-prefixed `/`-separated entry paths; deterministic transfer id = BLAKE3 of the
@@ -61,7 +75,7 @@ corruption, and **scan-based resume**: interrupted transfers stay staged
 loopback (incl. an abort-mid-transfer resume test) and verified 2 GiB byte-identical between two
 CLI processes.
 
-Phase 2 + `docs/Transports.md`: `conduit-net` is a **pluggable link layer** — a `Transport` trait
+Phase 2 + `docs/TRANSPORTS.md`: `conduit-net` is a **pluggable link layer** — a `Transport` trait
 with Thunderbolt/USB4, Ethernet (direct-cable vs LAN via the no-gateway + link-local rule), WiFi,
 and USB-bridge (CDC-NCM/RNDIS; tethers with a gateway are classified as shared "USB network
 device") implementations, aggregated and ranked `(direct, speed_tier, base_priority)` by
@@ -82,8 +96,9 @@ the staged state. CLI: `peers [--watch]`, `send --peer <name>`. **Deferred from 
 shared-folder browsing + inbox-per-peer (not in the phase's acceptance criteria; shares its
 machinery with Phase 4's `ListDir`/`ReadRange`, so build it there).
 
-`conduit-fs` (mount, Phase 4) is still a typed stub. CI runs on a Linux + Windows matrix (currently
-disabled on GitHub: private repo without Actions billing).
+CI runs on a Linux + Windows matrix (currently disabled on GitHub: private repo without Actions
+billing). `.github/workflows/release.yml` builds unsigned installers for all three platforms into a
+draft GitHub release, triggered by pushing a `v*` tag.
 
 Two things that will bite you if you don't know them:
 
@@ -166,10 +181,30 @@ conduit/
 │   └── src/
 ├── .github/workflows/ci.yml  # Linux + Windows matrix
 └── docs/
-    ├── ARCHITECTURE.md
-    ├── PROTOCOL.md
-    └── ROADMAP.md
+    ├── ARCHITECTURE.md   # system design + performance model
+    ├── PROTOCOL.md       # wire format, normative
+    ├── ROADMAP.md        # phase order + acceptance criteria
+    ├── TRANSPORTS.md     # link classification/ranking rules
+    └── SETUP.md          # end-user guide
 ```
+
+`conduit-core` module map (read in this order — each layer only uses the ones above it):
+
+| Module | Owns |
+|---|---|
+| `protocol` | `Hello`, `DeviceId`, `Capabilities`, `PROTOCOL_VERSION`. Handshake vocabulary only. |
+| `wire` | Framing (u32-LE length + `postcard`) and every control message, incl. `FsOp`/`FsResult`. Chunk payloads travel as raw bytes *after* their header frame, never inside it. |
+| `identity` | Persistent self-signed device cert, `Fingerprint`, `TrustStore` (TOFU pins). |
+| `transport` | QUIC endpoint/`PeerSession`. The rustls verifiers accept *any* cert on purpose — trust is decided one layer up by fingerprint, not by the TLS chain. |
+| `chunk` | Chunk arithmetic + streaming BLAKE3 (`FileHasher`). |
+| `manifest` | File/folder-tree manifests; `TransferId` = BLAKE3 of the manifest content, so it is deterministic and drives resume. |
+| `transfer` | The engine: `send_path` / `receive_one` / `serve_session` (which also classifies a session as transfer-vs-filesystem on its first control message), staging, verify, resume. |
+| `fsops` | Phase 4: `serve_fs` (share-root side, validates every inbound path) and `FsClient` (mount side). Writes are deliberately absent — a mount write spools locally and re-uses `transfer`. |
+| `error` | `Error`/`Result` for the whole crate. |
+
+Per-device state lives in one directory (`--identity-dir` on the CLI, the Tauri app config dir in
+the app): `device.key`/`device.crt` (persistent self-signed identity), `trusted.json` (pinned peer
+fingerprints), plus the app's `settings.json` and `history.json`.
 
 Keep `conduit-core` free of Tauri and UI dependencies so it can be tested headless and reused (CLI,
 tests, benchmarks). Tauri commands in `src-tauri` are thin wrappers over the crates.
@@ -206,6 +241,11 @@ All of these run from the repo root.
 npm install
 npm run build
 
+# Linux only — src-tauri's system deps (the other crates need none):
+sudo apt install libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev \
+                 libxdo-dev libssl-dev libdbus-1-dev pkg-config patchelf
+# ...and `fuse3` at runtime for `conduit mount` (/dev/fuse + fusermount3).
+
 # Rust
 cargo build --workspace
 cargo test --workspace
@@ -220,8 +260,17 @@ npm run tauri dev        # Tauri v2 + React frontend, hot-reloading
 npm run tauri build      # release bundles
 
 # Headless — the scripted E2E and benchmark path
-cargo run -p conduit-cli -- doctor
-cargo run -p conduit-cli -- hash <file>
+cargo run -p conduit-cli -- doctor          # ranked links + identity fingerprint
+cargo run -p conduit-cli -- hash <file>     # verify a transfer byte-for-byte
+
+# Two instances on one machine: --identity-dir gives each its own device identity +
+# trust store; --trust skips the interactive pairing prompt so scripts don't block.
+cargo run --release -p conduit-cli -- receive --dest recv --identity-dir idA [--forever]
+cargo run --release -p conduit-cli -- send <file-or-dir> --peer <name> --identity-dir idB
+cargo run --release -p conduit-cli -- peers [--watch]
+cargo run --release -p conduit-cli -- mount X: --peer <name> --identity-dir idB   # Windows
+cargo run --release -p conduit-cli -- trusted list|rename|revoke
+cargo run --release -p conduit-cli -- bench --to <addr> --size-gib 1 --streams 8
 ```
 
 ## Testing strategy

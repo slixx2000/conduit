@@ -1,6 +1,6 @@
 [package]
 name = "conduit-fs"
-description = "Virtual mounted volume: the peer's shared area as a drive (WinFsp on Windows; FUSE ports pending)."
+description = "Virtual mounted volume: the peer's shared area as a drive (WinFsp on Windows, FUSE on Linux; macFUSE pending)."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -22,3 +22,6 @@ windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_Fil
 # Emits the /DELAYLOAD linker flags so the binary starts even without WinFsp
 # installed (mount() then reports DriverMissing instead of failing to launch).
 winfsp = { version = "0.13.0", features = ["build"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+fuser = { version = "0.18.0", default-features = false }

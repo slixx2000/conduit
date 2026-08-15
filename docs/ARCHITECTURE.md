@@ -216,8 +216,17 @@ Resolved:
   discovery preference, and the UI's Connection panel (with manual override), not the socket bind;
   revisit if interface-scoped binding is ever needed for isolation.
 
+- **Mount write semantics: buffered-then-flush** (both backends). A file created in the mount
+  spools to a local temp file and is handed to the transfer engine when its last handle closes
+  (WinFsp `cleanup`, FUSE `release`) — the chunked pipeline keeps its per-chunk verification and
+  resume, which a true streaming write would have to reinvent. The costs are accepted: a spool
+  copy on local disk, no in-place overwrite of a remote file (`EPERM`), and writes into a
+  subdirectory of the mount landing in the peer's inbox root.
+- **Linux FUSE backend uses `fuser` with `default-features = false`** — no libfuse at build time
+  (mounting shells out to `fusermount3`), so `conduit-fs` builds on any Linux and only needs
+  `/dev/fuse` at runtime.
+
 Still open:
 
 - QUIC (`quinn`) vs parallel TLS-over-TCP: default to QUIC; if profiling shows userspace QUIC is
   CPU-bound near link ceiling, add a TCP+`sendfile` fast path behind the same transport trait.
-- FUSE write semantics for large drag-drops: buffered-then-flush vs. true streaming write.

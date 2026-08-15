@@ -14,6 +14,8 @@ pub enum KindHint {
     Wireless,
     /// Loopback, tunnels, and anything else that can never carry the data path.
     Excluded,
+    /// Only the Windows and macOS classifiers produce this; sysfs always decides.
+    #[cfg_attr(target_os = "linux", allow(dead_code))]
     Unknown,
 }
 

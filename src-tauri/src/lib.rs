@@ -409,12 +409,43 @@ async fn peer_rows(state: &AppState) -> Vec<PeerRow> {
     rows
 }
 
-/// First drive letter with nothing behind it, scanning backwards from Z:.
-fn free_drive_letter() -> Option<String> {
-    ('D'..='Z')
-        .rev()
-        .map(|c| format!("{c}:"))
-        .find(|d| !std::path::Path::new(&format!("{d}\\")).exists())
+/// Where a peer's drive appears: a free drive letter on Windows (the first with
+/// nothing behind it, scanning backwards from Z:), a folder under the
+/// home directory elsewhere (FUSE mounts onto a directory, which `conduit-fs`
+/// creates if it is missing).
+fn mountpoint_for(home: Option<PathBuf>, peer: &str) -> Option<String> {
+    #[cfg(windows)]
+    {
+        let _ = (home, peer);
+        ('D'..='Z')
+            .rev()
+            .map(|c| format!("{c}:"))
+            .find(|d| !std::path::Path::new(&format!("{d}\\")).exists())
+    }
+    #[cfg(not(windows))]
+    {
+        let safe: String = peer
+            .chars()
+            .map(|c| {
+                if c.is_alphanumeric() || matches!(c, '-' | '_' | ' ') {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let name = match safe.trim() {
+            "" => "peer",
+            name => name,
+        };
+        Some(
+            home?
+                .join("Conduit")
+                .join(name)
+                .to_string_lossy()
+                .into_owned(),
+        )
+    }
 }
 
 /// Mount `peer_id`'s shared folder as a local drive. Returns the mount point.
@@ -435,7 +466,8 @@ async fn mount_peer(
         .get(&id)
         .cloned()
         .ok_or("that peer is no longer visible on the network")?;
-    let mountpoint = free_drive_letter().ok_or("no free drive letter")?;
+    let mountpoint =
+        mountpoint_for(app.path().home_dir().ok(), &peer.name).ok_or("no free mount point")?;
 
     let session = state
         .endpoint
@@ -1030,5 +1062,26 @@ mod tests {
         let json =
             serde_json::to_string(&app_info().await.unwrap()).expect("must serialize");
         assert!(json.contains("protocolVersion") || json.contains("protocol_version"));
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn mount_points_are_named_folders_under_home() {
+        let home = Some(PathBuf::from("/home/u"));
+        assert_eq!(
+            mountpoint_for(home.clone(), "Shaun's Laptop").unwrap(),
+            "/home/u/Conduit/Shaun_s Laptop",
+            "path separators and quotes must not escape the Conduit folder"
+        );
+        assert_eq!(
+            mountpoint_for(home.clone(), "../../etc").unwrap(),
+            "/home/u/Conduit/______etc"
+        );
+        assert_eq!(
+            mountpoint_for(home, "  ").unwrap(),
+            "/home/u/Conduit/peer",
+            "a blank name still needs somewhere to mount"
+        );
+        assert!(mountpoint_for(None, "any").is_none());
     }
 }
