@@ -41,12 +41,17 @@ jobs:
             patchelf
 
       # conduit-fs generates WinFsp bindings against the installed SDK (Developer
-      # feature) and needs libclang; the runner image ships LLVM.
+      # feature = ADDLOCAL=ALL) and needs libclang; the runner image ships LLVM.
+      # Installed from the upstream MSI rather than Chocolatey, whose community feed
+      # rate-limits CI runners (HTTP 499 → "package was not found").
       - name: Install WinFsp SDK (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          choco install winfsp -y --install-arguments="ADDLOCAL=ALL"
+          $msi = "$env:RUNNER_TEMP\winfsp.msi"
+          Invoke-WebRequest -Uri "https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi" -OutFile $msi
+          $p = Start-Process msiexec -ArgumentList "/i", $msi, "/qn", "ADDLOCAL=ALL" -Wait -PassThru -NoNewWindow
+          if ($p.ExitCode -ne 0) { throw "WinFsp install failed with exit code $($p.ExitCode)" }
           "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -Append $env:GITHUB_ENV
 
       - uses: actions/setup-node@v4
