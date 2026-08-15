@@ -112,6 +112,23 @@ cargo run --release -p conduit-cli -- receive --forever --trust --dest recv --id
 cargo run --release -p conduit-cli -- bench --to <addr> --size-gib 1 --streams 2 --streams 8 --identity-dir idB --trust
 ```
 
+## Releases
+
+`.github/workflows/release.yml` builds installers for all three platforms
+(Windows `.msi` + NSIS `.exe`, Linux `.deb` + AppImage, a universal macOS `.dmg`)
+and uploads them to a **draft** GitHub release. Cut one by pushing a version tag:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+Then review the draft release on GitHub and publish it. (The Actions tab also has a
+manual "Run workflow" button for a test build.) Builds are currently **unsigned** —
+users get a one-time OS prompt on first launch (see `docs/SETUP.md`); Linux needs
+none. To sign later, add the secrets noted in the workflow's `env:` block; no other
+change is required.
+
 ## License
 
 MIT OR Apache-2.0.

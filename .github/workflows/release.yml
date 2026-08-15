@@ -1,0 +1,117 @@
+name: Release
+
+# Builds installers for all three desktop platforms and uploads them to a GitHub
+# release. Runs on a version tag (`git tag v0.1.0 && git push --tags`), or manually
+# via the Actions tab for a test build.
+#
+# Builds are UNSIGNED for now. Users see a one-time OS prompt (Windows SmartScreen,
+# macOS Gatekeeper); Linux needs no bypass. See docs/SETUP.md. To sign later, add the
+# secrets noted in the `env:` block below — no other change to this file is needed.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build (e.g. v0.1.0)"
+        required: true
+        default: v0.0.0-test
+
+# tauri-action creates the release with the built-in token.
+permissions:
+  contents: write
+
+jobs:
+  release:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # One universal (Intel + Apple Silicon) macOS binary from the arm runner.
+          - platform: macos-latest
+            args: --target universal-apple-darwin
+            rust-targets: aarch64-apple-darwin,x86_64-apple-darwin
+          # Build on the oldest supported Ubuntu so the .deb/AppImage run on the
+          # widest range of distros (lower glibc floor). deb + AppImage only — rpm
+          # would need rpmbuild on the runner.
+          - platform: ubuntu-22.04
+            args: --bundles deb,appimage
+            rust-targets: ""
+          # Default Windows bundles: .msi + NSIS setup .exe.
+          - platform: windows-latest
+            args: ""
+            rust-targets: ""
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux system dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libxdo-dev \
+            libssl-dev \
+            patchelf
+
+      # conduit-fs generates WinFsp bindings against the installed SDK (Developer
+      # feature) and needs libclang; the runner image ships LLVM.
+      - name: Install WinFsp SDK (Windows)
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: |
+          choco install winfsp -y --install-arguments="ADDLOCAL=ALL"
+          "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -Append $env:GITHUB_ENV
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-targets }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.platform }}
+
+      - name: Build and release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # --- Code signing (unset today → unsigned builds). To enable later: ---
+          # Windows (Azure Trusted Signing, or a cert via a custom signCommand in
+          #   tauri.conf.json): no secrets needed here for a thumbprint-based cert;
+          #   for Azure add AZURE_* per the trusted-signing action docs.
+          # macOS signing + notarization — add all of:
+          #   APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          #   APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          #   APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          #   APPLE_ID: ${{ secrets.APPLE_ID }}
+          #   APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}     # app-specific password
+          #   APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # Tauri auto-updater signature (separate from OS signing, free):
+          #   TAURI_SIGNING_PRIVATE_KEY / TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+        with:
+          tagName: ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}
+          releaseName: Conduit ${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}
+          releaseBody: |
+            Unsigned builds. First launch shows a one-time OS prompt:
+            - Windows: SmartScreen → More info → Run anyway. "Mount as drive" also needs WinFsp (https://winfsp.dev).
+            - macOS: right-click the app → Open (Gatekeeper).
+            - Linux: no bypass needed.
+
+            See docs/SETUP.md for the full guide.
+          releaseDraft: true
+          prerelease: false
+          args: ${{ matrix.args }}
