@@ -134,11 +134,17 @@ git push origin v0.1.0
 ```
 
 Then review the draft release on GitHub and publish it. (The Actions tab also has a
-manual "Run workflow" button for a test build.) Builds are currently **unsigned** —
+manual "Run workflow" button for a test build.) Building the bundles *locally* on
+Linux works too (`npm run tauri build`), with one gotcha: the AppImage step
+downloads `linuxdeploy-plugin-{gtk,gstreamer}.sh`, and the bundler's HTTP client
+tries IPv6 first — on a network without working IPv6 it stalls until its global
+timeout instead of falling back. Fetch them into `~/.cache/tauri/` with `curl` and
+re-run; the `.deb` and `.rpm` are unaffected. Builds are currently **unsigned** —
 users get a one-time OS prompt on first launch (see `docs/SETUP.md`); Linux needs
 none. To sign later, add the secrets noted in the workflow's `env:` block; no other
 change is required.
 
 ## License
 
-MIT OR Apache-2.0.
+Dual-licensed under either [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at
+your option.

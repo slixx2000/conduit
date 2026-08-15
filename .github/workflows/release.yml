@@ -58,6 +58,8 @@ jobs:
             librsvg2-dev \
             libxdo-dev \
             libssl-dev \
+            libdbus-1-dev \
+            pkg-config \
             patchelf
 
       # conduit-fs generates WinFsp bindings against the installed SDK (Developer
@@ -108,8 +110,8 @@ jobs:
           releaseBody: |
             Unsigned builds. First launch shows a one-time OS prompt:
             - Windows: SmartScreen → More info → Run anyway. "Mount as drive" also needs WinFsp (https://winfsp.dev).
-            - macOS: right-click the app → Open (Gatekeeper).
-            - Linux: no bypass needed.
+            - macOS: right-click the app → Open (Gatekeeper). "Mount as drive" is not available on macOS yet.
+            - Linux: no bypass needed. "Mount as drive" needs FUSE (`sudo apt install fuse3`).
 
             See docs/SETUP.md for the full guide.
           releaseDraft: true
