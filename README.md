@@ -47,6 +47,79 @@ it headless: `conduit receive` on one side, `conduit send <path> --peer <name>` 
 other. See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the phase plan and acceptance
 criteria.
 
+## Install
+
+Grab the installer for your OS from the [Releases](https://github.com/slixx2000/conduit/releases)
+page. While the repo is private, download them signed-in or with the GitHub CLI:
+
+```bash
+gh release download <tag> -R slixx2000/conduit                # every asset
+gh release download <tag> -R slixx2000/conduit -p '*.msi'      # just one
+```
+
+Every build is **unsigned**, so each desktop OS shows a one-time warning the first
+time you launch it — the bypass is noted per platform below. The installers ship the
+desktop app (`conduit-app`) only; the headless `conduit` CLI comes from
+`cargo build -p conduit-cli`.
+
+### Windows — `.msi` or `-setup.exe`
+
+Double-click either one (the `.msi` is the plain installer, the `-setup.exe` is the
+NSIS one — pick whichever your tooling prefers). SmartScreen will warn: **More info →
+Run anyway**. Silent installs:
+
+```powershell
+msiexec /i Conduit_0.1.0_x64_en-US.msi /qn      # .msi
+.\Conduit_0.1.0_x64-setup.exe /S                # NSIS
+```
+
+*Mount as drive* additionally needs [WinFsp](https://winfsp.dev):
+`winget install WinFsp.WinFsp`. Uninstall from Add or remove programs.
+
+### Linux — `.deb` (Debian, Ubuntu, Mint)
+
+```bash
+sudo apt install ./Conduit_0.1.0_amd64.deb     # resolves dependencies; dpkg -i does not
+conduit-app                                     # or launch it from your app menu
+```
+
+`fuse3` is a recommended dependency and normally comes along; install it explicitly
+(`sudo apt install fuse3`) if *Mount as drive* reports FUSE missing. Remove with
+`sudo apt remove conduit`.
+
+### Linux — AppImage (any distro)
+
+```bash
+chmod +x Conduit_0.1.0_amd64.AppImage
+./Conduit_0.1.0_amd64.AppImage
+```
+
+No installation and nothing to uninstall — delete the file. Two FUSE caveats, and
+they are different things:
+
+- The AppImage *format* needs libfuse2 to self-mount. Ubuntu 22.04+/Mint 21+ ship
+  only libfuse3, so if it fails with `dlopen(): error loading libfuse.so.2`, either
+  `sudo apt install libfuse2t64` (older releases: `libfuse2`) or skip it entirely
+  with `./Conduit_0.1.0_amd64.AppImage --appimage-extract-and-run`.
+- Conduit's own *Mount as drive* needs `fuse3`, which the AppImage cannot install
+  for you: `sudo apt install fuse3`.
+
+### macOS — `.dmg`
+
+Open the `.dmg` and drag Conduit to Applications. Gatekeeper blocks unsigned apps on
+first launch: **right-click the app → Open**, then confirm. From a terminal instead:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/Conduit.app
+```
+
+*Mount as drive* is not available on macOS yet. Uninstall by dragging the app to the
+Trash. (`Conduit_universal.app.tar.gz` is the same app bundle without the disk image —
+use it only if you prefer extracting the `.app` by hand.)
+
+For what to do once it is running — pairing, sending, mounting, troubleshooting — see
+[`docs/SETUP.md`](docs/SETUP.md).
+
 ## Layout
 
 | Path | Purpose |
