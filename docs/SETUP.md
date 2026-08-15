@@ -7,12 +7,28 @@ technical docs live next to it in `docs/`.
 
 ## 1. Install
 
-**Windows**: run the Conduit `.msi` installer. To use *Mount as drive* you also need
-the free [WinFsp](https://winfsp.dev/rel/) driver (one-time install; Conduit tells
-you if it's missing). Everything else works without it.
+Download the installer for your OS from the project's GitHub Releases page:
 
-**Linux / macOS**: packages are not produced yet — build from source (see
-`README.md`). Mounting will need FUSE/macFUSE once those ports land.
+- **Windows**: the `.msi` (or the NSIS `-setup.exe`). To use *Mount as drive* you also
+  need the free [WinFsp](https://winfsp.dev/rel/) driver (one-time install; Conduit
+  tells you if it's missing). Everything else works without it.
+- **Linux**: the `.deb` (`sudo dpkg -i conduit_*.deb`) or the AppImage
+  (`chmod +x` and run it). *Mount as drive* is not available on Linux yet.
+- **macOS**: the `.dmg` (universal — Intel and Apple Silicon). *Mount as drive* is not
+  available on macOS yet.
+
+> **First launch — one-time "unrecognized app" prompt.** The current builds are
+> **unsigned**, so your OS asks for confirmation the first time. This is expected;
+> after you allow it once, it never asks again.
+>
+> - **Windows** — SmartScreen shows *"Windows protected your PC."* Click **More info →
+>   Run anyway**.
+> - **macOS** — Gatekeeper says it *"cannot check it for malicious software."*
+>   **Right-click (or Control-click) the app → Open**, then confirm. (Double-clicking
+>   won't give you the Open button; the right-click menu does.)
+> - **Linux** — no prompt; nothing to do.
+>
+> Signed builds will remove these prompts in a future release.
 
 The first launch creates your device identity and starts listening. There is no
 account and no server: everything is directly between your two machines.
