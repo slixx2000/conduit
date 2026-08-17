@@ -673,6 +673,23 @@ async fn send_to_peer(
             async move {
                 let mut outcome: Result<(), String> = Err("never attempted".into());
 
+                // Pair up front, while the user is still at the screen: hashing a
+                // large folder takes many minutes, and a pairing prompt that pops
+                // *after* that sits unanswered until the connection idles out. The
+                // session is dropped once the pin is recorded; the transfer redials.
+                {
+                    let state = app.state::<AppState>();
+                    if let Ok(candidates) = resolve_target(&state, &target).await {
+                        if let Ok(session) = state.endpoint.connect_any(&candidates).await {
+                            match pair_with_ui(&app, session, "outgoing").await {
+                                Ok(_) | Err(conduit_core::Error::Connection(_)) => {}
+                                Err(conduit_core::Error::PairingRejected) => return,
+                                Err(_) => {}
+                            }
+                        }
+                    }
+                }
+
                 // Hash the source once, with UI feedback — a large folder takes real
                 // time to manifest, and re-hashing it on every retry doubled the pain.
                 let prep_name = Path::new(&path)
@@ -730,6 +747,9 @@ async fn send_to_peer(
                 };
                 let _turn = queue.lock().await;
 
+                // mDNS records blink out (host busy, record expiry) while the peer
+                // is still reachable; fall back to the last address that resolved.
+                let mut last_candidates: Option<Vec<SocketAddr>> = None;
                 for attempt in 0..=SEND_RETRIES {
                     let Some(manifest) = manifest.as_ref() else { break };
                     if attempt > 0 {
@@ -739,7 +759,13 @@ async fn send_to_peer(
                     // Re-resolve each attempt: the peer's address may have changed
                     // when the link came back.
                     let candidates = match resolve_target(&state, &target).await {
-                        Ok(a) => a,
+                        Ok(a) => {
+                            last_candidates = Some(a.clone());
+                            a
+                        }
+                        Err(_) if last_candidates.is_some() => {
+                            last_candidates.clone().expect("just checked")
+                        }
                         Err(_) if attempt < SEND_RETRIES => continue,
                         Err(e) => {
                             outcome = Err(e);
@@ -785,7 +811,12 @@ async fn send_to_peer(
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| path.clone());
-                let bytes = std::fs::metadata(source).map(|m| m.len()).unwrap_or(0);
+                // For folders fs::metadata reports the directory inode size (a few
+                // KiB); the manifest knows the real payload.
+                let bytes = manifest
+                    .as_ref()
+                    .map(|m| m.total_bytes)
+                    .unwrap_or_else(|| std::fs::metadata(source).map(|m| m.len()).unwrap_or(0));
                 let peer_name = {
                     let state = app.state::<AppState>();
                     let peers = state.peers.lock().await;
