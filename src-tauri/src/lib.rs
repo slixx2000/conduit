@@ -580,6 +580,50 @@ async fn resolve_target(state: &AppState, target: &str) -> Result<Vec<SocketAddr
     Err("expected a discovered peer or an ip:port address".into())
 }
 
+/// Android's file picker hands back a provider-owned `content://` URI, not a path.
+/// The transfer engine re-opens its source by path (manifest, rehash-on-resume), so
+/// spool the content into the app cache and send that — the same spool-then-ship
+/// shape as the mount's write path.
+#[cfg(target_os = "android")]
+fn materialize_content_uri(app: &AppHandle, uri: &str) -> Result<String, String> {
+    use std::os::fd::AsRawFd;
+    use tauri_plugin_fs::{FilePath, FsExt, OpenOptions};
+
+    let parsed: FilePath = uri
+        .parse()
+        .map_err(|e| format!("unusable picked file ({e})"))?;
+    let mut opts = OpenOptions::new();
+    opts.read(true);
+    let mut src = app
+        .fs()
+        .open(parsed, opts)
+        .map_err(|e| format!("could not open the picked file: {e}"))?;
+
+    // The provider's fd usually points at the real file, whose basename is the
+    // human-readable name; pipe-backed providers fall back to the URI tail.
+    let name = std::fs::read_link(format!("/proc/self/fd/{}", src.as_raw_fd()))
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| {
+            uri.rsplit('/')
+                .next()
+                .filter(|t| !t.is_empty())
+                .unwrap_or("picked-file")
+                .to_string()
+        });
+
+    let dir = app
+        .path()
+        .app_cache_dir()
+        .map_err(|e| e.to_string())?
+        .join("outgoing");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let dest = dir.join(&name);
+    let mut out = std::fs::File::create(&dest).map_err(|e| e.to_string())?;
+    std::io::copy(&mut src, &mut out).map_err(|e| e.to_string())?;
+    Ok(dest.to_string_lossy().into_owned())
+}
+
 /// Start sending `path` to `target` (peer id or address). Returns as soon as the job
 /// is spawned; progress, errors, and completion arrive as events. On connection loss
 /// the job redials and re-offers — the receiver's staged partial turns that into a
@@ -593,6 +637,18 @@ async fn send_to_peer(
 ) -> Result<(), String> {
     // Validate the target once up front so a typo fails the command visibly.
     resolve_target(&state, &target).await?;
+
+    // ponytail: the spool copy finishes before this command returns, so a huge pick
+    // sits silent until staged; stream progress events if that ever matters.
+    #[cfg(target_os = "android")]
+    let path = if path.starts_with("content://") {
+        let app = app.clone();
+        tauri::async_runtime::spawn_blocking(move || materialize_content_uri(&app, &path))
+            .await
+            .map_err(|e| e.to_string())??
+    } else {
+        path
+    };
 
     let active = Arc::clone(&state.active);
     let app = app.clone();
@@ -932,10 +988,16 @@ fn host_name() -> String {
         .unwrap_or_else(|_| "conduit-device".into())
 }
 
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_notification::init());
+    // Only Android needs the fs plugin, and only from Rust (content:// spooling in
+    // `send_to_peer`) — it is not exposed to the webview.
+    #[cfg(target_os = "android")]
+    let builder = builder.plugin(tauri_plugin_fs::init());
+    builder
         .setup(|app| {
             let identity_dir = app.path().app_config_dir()?;
             let default_inbox = app

@@ -8,7 +8,6 @@ ui/dist/
 *.log
 
 # Tauri generated
-src-tauri/gen/
 src-tauri/target/
 
 # OS

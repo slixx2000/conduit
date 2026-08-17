@@ -32,6 +32,14 @@ body,
   height: 100%;
 }
 
+/* Phones draw the webview edge-to-edge, under the status bar / camera cutout and
+   the gesture bar. Inset the app by the safe area; on desktop these are all 0. */
+body {
+  background: var(--color-conduit-bg);
+  padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom)
+    env(safe-area-inset-left);
+}
+
 @layer base {
   /* Every button in the app does real work behind an IPC round trip, so the press
      has to acknowledge itself immediately or the whole UI reads as laggy. Doing it

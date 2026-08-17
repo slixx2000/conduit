@@ -30,3 +30,8 @@ tauri-plugin-dialog = "2"
 tauri-plugin-notification = "2"
 tokio.workspace = true
 uuid.workspace = true
+
+# The Android file picker returns content:// URIs; only the fs plugin can open
+# those (it resolves them to a raw fd through the platform ContentResolver).
+[target.'cfg(target_os = "android")'.dependencies]
+tauri-plugin-fs = "2"

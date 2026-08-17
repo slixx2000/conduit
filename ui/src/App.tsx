@@ -124,6 +124,22 @@ function humanBytes(b: number): string {
   return `${v} ${u}`;
 }
 
+/** The backend surfaces raw Rust error chains. Translate the common ones into
+    something a person can act on; the original stays visible as fine print. */
+function friendlyError(raw: string): string | null {
+  if (/aborted by peer|closed during the handshake/i.test(raw))
+    return "The other device ended the connection during setup — usually a cancelled pairing or a version mismatch. Try again from either side.";
+  if (/timed out/i.test(raw))
+    return "Could not reach the other device. Make sure Conduit is running there and both machines share a network or a cable.";
+  if (/no such file or directory|os error 2/i.test(raw))
+    return "That file could not be read — it may have been moved or deleted.";
+  if (/connection (reset|refused|lost)|closed by peer/i.test(raw))
+    return "The connection dropped mid-way. Sending the same thing again resumes where it stopped.";
+  if (/invalid socket address|invalid (ip|address|port)/i.test(raw))
+    return "That address does not look right — use ip:port, like 169.254.10.5:4433.";
+  return null;
+}
+
 function humanEta(seconds: number): string {
   if (!isFinite(seconds) || seconds <= 0) return "";
   if (seconds < 60) return `${Math.ceil(seconds)} s left`;
@@ -241,7 +257,11 @@ export default function App() {
           });
           break;
         case "failed":
-          next.set(e.transfer_id, { ...base, state: "failed", detail: e.reason });
+          next.set(e.transfer_id, {
+            ...base,
+            state: "failed",
+            detail: friendlyError(e.reason) ?? e.reason,
+          });
           break;
       }
       return next;
@@ -463,7 +483,9 @@ export default function App() {
             {status ? status.device_name : "starting…"}
           </span>
           {status && (
-            <span className="font-mono text-[11px] text-slate-500">fp {status.fingerprint}</span>
+            <span className="hidden font-mono text-[11px] text-slate-500 sm:inline">
+              fp {status.fingerprint}
+            </span>
           )}
         </div>
         <button
@@ -500,7 +522,14 @@ export default function App() {
           )}
           {lastError && (
             <p className="flex items-start justify-between gap-3 rounded-lg bg-red-950/60 px-4 py-2.5 text-sm text-red-300 ring-1 ring-red-500/30">
-              <span>{lastError}</span>
+              <span className="min-w-0">
+                {friendlyError(lastError) ?? lastError}
+                {friendlyError(lastError) && (
+                  <span className="mt-1 block break-words font-mono text-[11px] text-red-400/50">
+                    {lastError}
+                  </span>
+                )}
+              </span>
               <button onClick={() => setLastError(null)} className="shrink-0 text-red-400/70">
                 Dismiss
               </button>
