@@ -683,7 +683,7 @@ dependencies = [
 
 [[package]]
 name = "conduit-app"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "conduit-core",
  "conduit-discovery",
@@ -702,7 +702,7 @@ dependencies = [
 
 [[package]]
 name = "conduit-cli"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "clap",
  "conduit-core",
@@ -716,7 +716,7 @@ dependencies = [
 
 [[package]]
 name = "conduit-core"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "blake3",
  "postcard",
@@ -735,7 +735,7 @@ dependencies = [
 
 [[package]]
 name = "conduit-discovery"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "conduit-core",
  "conduit-net",
@@ -748,7 +748,7 @@ dependencies = [
 
 [[package]]
 name = "conduit-fs"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "conduit-core",
  "fuser",
@@ -761,7 +761,7 @@ dependencies = [
 
 [[package]]
 name = "conduit-net"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
