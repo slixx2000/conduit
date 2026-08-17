@@ -79,6 +79,15 @@ pub enum ControlMessage {
         request_id: u64,
         result: FsResult,
     },
+    /// Sender could not read one entry of an in-flight transfer (locked, deleted,
+    /// permission). The receiver drops that entry and the transfer completes
+    /// without it — one bad file must not sink a 150 GB folder. Appended last so
+    /// every earlier variant keeps its postcard index (see ARCHITECTURE §8).
+    SkipEntry {
+        transfer_id: TransferId,
+        entry_index: u32,
+        reason: String,
+    },
 }
 
 /// Filesystem operations against the peer's shared area. Paths are share-relative,

@@ -9,8 +9,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use conduit_core::{
-    receive_one, send_path, serve_session, ConduitEndpoint, DeviceIdentity, FsClient,
-    FsEntryKind, ReceiveOptions, SendOptions, Served, TransferEvent, TrustStatus, TrustStore,
+    manifest_for_path, receive_one, send_manifest, send_path, serve_session, ConduitEndpoint,
+    DeviceIdentity, FsClient, FsEntryKind, ReceiveOptions, SendOptions, Served, TransferEvent,
+    TrustStatus, TrustStore,
 };
 use rand::RngCore;
 use tokio::sync::mpsc;
@@ -509,4 +510,85 @@ async fn receiving_into_a_dir_with_a_same_named_file_does_not_clobber() {
         std::fs::read(dest_dir.path().join("source.bin")).unwrap(),
         b"do not overwrite me"
     );
+}
+
+/// A file that becomes unreadable after the manifest is built (deleted, locked,
+/// permissions) must cost only that file: the rest of the tree still arrives and
+/// both sides report the skip.
+#[tokio::test(flavor = "multi_thread")]
+async fn unreadable_entry_is_skipped_not_fatal() {
+    let src_dir = tempfile::tempdir().unwrap();
+    let root = src_dir.path().join("bundle");
+    std::fs::create_dir(&root).unwrap();
+    for name in ["a.bin", "b.bin", "c.bin"] {
+        let mut data = vec![0u8; 300 * 1024];
+        rand::thread_rng().fill_bytes(&mut data);
+        std::fs::write(root.join(name), &data).unwrap();
+    }
+    let manifest = Arc::new(manifest_for_path(&root, 64 * 1024).await.unwrap());
+    std::fs::remove_file(root.join("b.bin")).unwrap();
+
+    let alice = make_peer("Alice");
+    let bob = make_peer("Bob");
+    let bob_addr = bob.endpoint.local_addr().unwrap();
+    let dest_dir = tempfile::tempdir().unwrap();
+    let dest = dest_dir.path().to_owned();
+    let (recv_tx, recv_rx) = mpsc::channel(4096);
+    let (send_tx, send_rx) = mpsc::channel(4096);
+    let receiver = tokio::spawn(async move {
+        let session = bob.endpoint.accept().await.expect("endpoint open").unwrap();
+        receive_one(session, ReceiveOptions { dest_dir: dest }, recv_tx).await
+    });
+
+    let session = alice.endpoint.connect(bob_addr).await.unwrap();
+    send_manifest(session, manifest, &root, SendOptions::default(), send_tx)
+        .await
+        .expect("send must survive one unreadable entry");
+    let received = receiver.await.unwrap().expect("receive must succeed");
+
+    assert_eq!(blake3_of(&received.join("a.bin")), blake3_of(&root.join("a.bin")));
+    assert_eq!(blake3_of(&received.join("c.bin")), blake3_of(&root.join("c.bin")));
+    assert!(
+        !received.join("b.bin").exists(),
+        "the skipped entry must not be delivered"
+    );
+
+    let send_events = drain(send_rx).await;
+    let recv_events = drain(recv_rx).await;
+    for (side, events) in [("sender", &send_events), ("receiver", &recv_events)] {
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                TransferEvent::EntrySkipped { path, .. } if path == "bundle/b.bin"
+            )),
+            "{side} must report the skipped entry"
+        );
+    }
+}
+
+/// When *nothing* is deliverable the transfer must fail loudly, not "complete"
+/// as an empty success.
+#[tokio::test(flavor = "multi_thread")]
+async fn transfer_with_every_entry_unreadable_fails() {
+    let src_dir = tempfile::tempdir().unwrap();
+    let source = random_file(src_dir.path(), 128 * 1024);
+    let manifest = Arc::new(manifest_for_path(&source, 64 * 1024).await.unwrap());
+    std::fs::remove_file(&source).unwrap();
+
+    let alice = make_peer("Alice");
+    let bob = make_peer("Bob");
+    let bob_addr = bob.endpoint.local_addr().unwrap();
+    let dest_dir = tempfile::tempdir().unwrap();
+    let dest = dest_dir.path().to_owned();
+    let (recv_tx, _recv_rx) = mpsc::channel(4096);
+    let (send_tx, _send_rx) = mpsc::channel(4096);
+    let receiver = tokio::spawn(async move {
+        let session = bob.endpoint.accept().await.expect("endpoint open").unwrap();
+        receive_one(session, ReceiveOptions { dest_dir: dest }, recv_tx).await
+    });
+
+    let session = alice.endpoint.connect(bob_addr).await.unwrap();
+    let sent = send_manifest(session, manifest, &source, SendOptions::default(), send_tx).await;
+    assert!(sent.is_err(), "an all-skipped transfer must fail");
+    assert!(receiver.await.unwrap().is_err());
 }

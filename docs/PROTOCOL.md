@@ -140,9 +140,15 @@ Initiator                         Responder
    │◄──────────  Ack{transfer_id, ok | Err{...}}
 ```
 
-Also defined: `Reject{transfer_id, reason}`, `Cancel{transfer_id, reason}`, `Bye{reason}`, and
-`ResendChunk{transfer_id, entry_index, chunk_index}` (§3.3). `Ack.result` is
-`Ok | Failed{reason}`. In Phase 1 `Accept.have_chunks` is always empty (the resume sidecar that
+Also defined: `Reject{transfer_id, reason}`, `Cancel{transfer_id, reason}`, `Bye{reason}`,
+`ResendChunk{transfer_id, entry_index, chunk_index}` (§3.3), and
+`SkipEntry{transfer_id, entry_index, reason}`: the sender could not read that entry
+(locked, deleted, permission) and will send none of its remaining chunks. The receiver stops
+expecting them, excludes the entry from verification, removes any partial from the delivered
+tree, and the transfer otherwise completes — both sides surface the skip as an event. If the
+entry is already fully staged (resume), the data wins and the skip is ignored; if *every* file
+entry is skipped, the receiver fails the transfer instead of delivering an empty success.
+`Ack.result` is `Ok | Failed{reason}`. In Phase 1 `Accept.have_chunks` is always empty (the resume sidecar that
 populates it lands in Phase 3); the bitmap orders chunks by **global index** — entries in manifest
 order, chunks in order within each entry, bit `i` of byte `i/8` at position `i%8` (LSB-first).
 

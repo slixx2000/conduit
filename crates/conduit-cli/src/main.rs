@@ -793,6 +793,9 @@ async fn print_events(mut events: mpsc::Receiver<TransferEvent>) {
             TransferEvent::ChunkResent { entry_index, chunk_index, .. } => {
                 println!("\n  chunk {chunk_index} of entry {entry_index} failed its hash — resending");
             }
+            TransferEvent::EntrySkipped { path, reason, .. } => {
+                println!("\n  SKIPPED {path}: {reason}");
+            }
             TransferEvent::Verifying { .. } => {
                 println!("\n  verifying whole-file BLAKE3 …");
             }

@@ -51,6 +51,7 @@ type TransferEvent =
       entry_index: number;
       chunk_index: number;
     }
+  | { kind: "entry_skipped"; transfer_id: string; path: string; reason: string }
   | { kind: "verifying"; transfer_id: string }
   | { kind: "completed"; transfer_id: string; path: string | null }
   | { kind: "failed"; transfer_id: string; reason: string };
@@ -89,6 +90,8 @@ type Transfer = {
   bytesDone: number;
   state: "running" | "verifying" | "done" | "failed";
   detail?: string;
+  /** Files the sender could not read; the transfer finished without them. */
+  skipped: string[];
   /** Smoothed bytes/second, derived here — the backend only reports byte counts. */
   rate: number;
   /** Recent rate readings, oldest first, for the sparkline. */
@@ -164,6 +167,8 @@ export default function App() {
   const [mountBusy, setMountBusy] = useState<string | null>(null);
   /** Live drag: how many files are held, and which peer card is under the cursor. */
   const [drag, setDrag] = useState<{ count: number; targetId: string | null } | null>(null);
+  /** Sends still hashing their source (large folders take a while), name → count. */
+  const [preparing, setPreparing] = useState<Map<string, number>>(new Map());
 
   // The transfer list renders newest-first; keep insertion order for stability.
   const orderRef = useRef<string[]>([]);
@@ -186,6 +191,7 @@ export default function App() {
         state: "running",
         rate: 0,
         samples: [],
+        skipped: [],
       };
       if (!existing) orderRef.current.unshift(e.transfer_id);
 
@@ -245,6 +251,12 @@ export default function App() {
             detail: `chunk ${e.chunk_index} failed its hash — re-sent`,
           });
           break;
+        case "entry_skipped":
+          next.set(e.transfer_id, {
+            ...base,
+            skipped: [...base.skipped, `${e.path} — ${e.reason}`],
+          });
+          break;
         case "verifying":
           next.set(e.transfer_id, { ...base, state: "verifying" });
           break;
@@ -252,7 +264,8 @@ export default function App() {
           next.set(e.transfer_id, {
             ...base,
             state: "done",
-            bytesDone: base.totalBytes,
+            // With skipped files the total is deliberately never reached.
+            bytesDone: base.skipped.length > 0 ? base.bytesDone : base.totalBytes,
             detail: e.path ?? undefined,
           });
           break;
@@ -325,6 +338,15 @@ export default function App() {
         }),
         listen<HistoryEntry[]>("conduit://history", (ev) => setHistoryList(ev.payload)),
         listen<{ message: string }>("conduit://error", (ev) => setLastError(ev.payload.message)),
+        listen<{ name: string; done: boolean }>("conduit://preparing", (ev) => {
+          setPreparing((prev) => {
+            const next = new Map(prev);
+            const n = (next.get(ev.payload.name) ?? 0) + (ev.payload.done ? -1 : 1);
+            if (n <= 0) next.delete(ev.payload.name);
+            else next.set(ev.payload.name, n);
+            return next;
+          });
+        }),
       ];
 
       dragUnlisten = getCurrentWebview().onDragDropEvent((event) => {
@@ -608,7 +630,17 @@ export default function App() {
             )}
           </div>
 
-          {transferList.length === 0 ? (
+          {[...preparing.keys()].map((name) => (
+            <div
+              key={`prep-${name}`}
+              className="animate-pulse rounded-xl border border-dashed border-white/10 px-4 py-3 text-sm text-slate-400"
+            >
+              Preparing <span className="font-medium text-slate-200">{name}</span> — reading and
+              hashing before the send starts…
+            </div>
+          ))}
+
+          {transferList.length === 0 && preparing.size === 0 ? (
             <div className="rounded-xl border border-dashed border-white/10 px-5 py-7 text-center text-sm text-slate-500">
               <p className="font-medium text-slate-400">Nothing transferring</p>
               <p className="mt-1">
@@ -1023,13 +1055,33 @@ function TransferCard({ t, onCancel }: { t: Transfer; onCancel: () => void }) {
         ) : (
           <span
             className={`shrink-0 text-xs ${
-              t.state === "done" ? "text-emerald-400" : "text-red-400"
+              t.state === "failed"
+                ? "text-red-400"
+                : t.skipped.length > 0
+                  ? "text-amber-400"
+                  : "text-emerald-400"
             }`}
           >
-            {t.state === "done" ? "done" : "failed"}
+            {t.state === "failed"
+              ? "failed"
+              : t.skipped.length > 0
+                ? `done — ${t.skipped.length} skipped`
+                : "done"}
           </span>
         )}
       </div>
+
+      {t.skipped.length > 0 && (
+        <div className="rounded-lg bg-amber-950/40 px-3 py-2 text-[11px] text-amber-300/90 ring-1 ring-amber-500/20">
+          <p className="font-medium">Could not be read on the sending side:</p>
+          {t.skipped.slice(0, 3).map((s) => (
+            <p key={s} className="truncate font-mono">
+              {s}
+            </p>
+          ))}
+          {t.skipped.length > 3 && <p>…and {t.skipped.length - 3} more</p>}
+        </div>
+      )}
 
       {/* The rate is the point of the product; give it the room to say so. */}
       {live && (

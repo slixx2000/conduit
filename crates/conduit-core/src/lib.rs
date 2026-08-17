@@ -27,7 +27,8 @@ pub use manifest::{manifest_for_path, Entry, EntryKind, Manifest, TransferId};
 pub use protocol::{Capabilities, DeviceId, Hello, PROTOCOL_VERSION};
 pub use fsops::FsClient;
 pub use transfer::{
-    receive_one, send_path, serve_session, ReceiveOptions, SendOptions, Served, TransferEvent,
+    receive_one, send_manifest, send_path, serve_session, ReceiveOptions, SendOptions, Served,
+    TransferEvent,
     DEFAULT_STREAM_COUNT,
 };
 pub use transport::{ConduitEndpoint, PeerInfo, PeerSession, Side};

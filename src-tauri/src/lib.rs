@@ -81,6 +81,10 @@ struct AppState {
     _discovery: Discovery,
     /// Live mounts of peers as local drives, keyed by peer.
     mounts: Arc<Mutex<HashMap<DeviceId, ActiveMount>>>,
+    /// One-transfer-at-a-time gate per send target. A multi-file drop otherwise
+    /// opens a QUIC connection per file, all racing each other.
+    /// ponytail: entries are never pruned — bounded by distinct targets, which is tiny.
+    send_queues: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     /// The pluggable link layer (`docs/Transports.md`).
     transports: conduit_net::TransportManager,
     /// User-pinned interface name; `None` = auto-select the fastest link.
@@ -660,7 +664,45 @@ async fn send_to_peer(
             let app = app.clone();
             async move {
                 let mut outcome: Result<(), String> = Err("never attempted".into());
+
+                // Hash the source once, with UI feedback — a large folder takes real
+                // time to manifest, and re-hashing it on every retry doubled the pain.
+                let prep_name = Path::new(&path)
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.clone());
+                let _ = app.emit(
+                    "conduit://preparing",
+                    serde_json::json!({ "name": prep_name, "done": false }),
+                );
+                let chunk_size = {
+                    let state = app.state::<AppState>();
+                    let s = state.settings.lock().await.send_options();
+                    s.chunk_size
+                };
+                let manifest =
+                    match conduit_core::manifest_for_path(Path::new(&path), chunk_size).await {
+                        Ok(m) => Some(Arc::new(m)),
+                        Err(e) => {
+                            outcome = Err(format!("could not read {prep_name}: {e}"));
+                            None
+                        }
+                    };
+                let _ = app.emit(
+                    "conduit://preparing",
+                    serde_json::json!({ "name": prep_name, "done": true }),
+                );
+
+                // One transfer at a time per target (see AppState::send_queues).
+                let queue = {
+                    let state = app.state::<AppState>();
+                    let mut queues = state.send_queues.lock().await;
+                    Arc::clone(queues.entry(target.clone()).or_default())
+                };
+                let _turn = queue.lock().await;
+
                 for attempt in 0..=SEND_RETRIES {
+                    let Some(manifest) = manifest.as_ref() else { break };
                     if attempt > 0 {
                         tokio::time::sleep(SEND_RETRY_DELAY).await;
                     }
@@ -679,8 +721,14 @@ async fn send_to_peer(
                     let result = async {
                         let session = state.endpoint.connect_any(&candidates).await?;
                         let session = pair_with_ui(&app, session, "outgoing").await?;
-                        conduit_core::send_path(session, Path::new(&path), opts, events.clone())
-                            .await
+                        conduit_core::send_manifest(
+                            session,
+                            Arc::clone(manifest),
+                            Path::new(&path),
+                            opts,
+                            events.clone(),
+                        )
+                        .await
                     }
                     .await;
 
@@ -803,6 +851,7 @@ fn transfer_id_of(event: &TransferEvent) -> TransferId {
         | TransferEvent::Resumed { transfer_id, .. }
         | TransferEvent::Progress { transfer_id, .. }
         | TransferEvent::ChunkResent { transfer_id, .. }
+        | TransferEvent::EntrySkipped { transfer_id, .. }
         | TransferEvent::Verifying { transfer_id }
         | TransferEvent::Completed { transfer_id, .. }
         | TransferEvent::Failed { transfer_id, .. } => *transfer_id,
@@ -1049,6 +1098,7 @@ pub fn run() {
                 peers: Arc::new(Mutex::new(HashMap::new())),
                 active: Arc::new(Mutex::new(HashMap::new())),
                 mounts: Arc::new(Mutex::new(HashMap::new())),
+                send_queues: Arc::new(Mutex::new(HashMap::new())),
                 _discovery: discovery,
                 transports: conduit_net::TransportManager::with_defaults(),
                 link_override: Arc::new(Mutex::new(None)),

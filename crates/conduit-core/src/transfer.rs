@@ -81,6 +81,13 @@ pub enum TransferEvent {
         entry_index: u32,
         chunk_index: u32,
     },
+    /// One entry could not be read on the sender and was dropped from the transfer
+    /// (see `ControlMessage::SkipEntry`). The transfer itself continues.
+    EntrySkipped {
+        transfer_id: TransferId,
+        path: String,
+        reason: String,
+    },
     /// Receiver is running the whole-file hashes before the atomic rename.
     Verifying { transfer_id: TransferId },
     /// Done. `path` is the final on-disk location on the receiving side.
@@ -177,6 +184,19 @@ pub async fn send_path(
     events: mpsc::Sender<TransferEvent>,
 ) -> Result<()> {
     let manifest = Arc::new(manifest_for_path(path, opts.chunk_size).await?);
+    send_manifest(session, manifest, path, opts, events).await
+}
+
+/// [`send_path`] with a pre-built manifest. Hashing a large tree takes real time, so
+/// callers that retry a send (redial + resume) build the manifest once and reuse it
+/// here instead of re-hashing the source on every attempt.
+pub async fn send_manifest(
+    session: PeerSession,
+    manifest: Arc<Manifest>,
+    path: &Path,
+    opts: SendOptions,
+    events: mpsc::Sender<TransferEvent>,
+) -> Result<()> {
     let transfer_id = manifest.transfer_id;
 
     let result = send_inner(&session, Arc::clone(&manifest), path, &opts, &events).await;
@@ -309,6 +329,11 @@ async fn send_inner(
     // offered path: sending /x/photos reads /x/ + "photos/2024/a.jpg".
     let source_base = path.parent().unwrap_or(Path::new("")).to_owned();
 
+    // Entries the sender failed to read (locked, deleted, permission), by index.
+    // One bad file drops out of the transfer instead of sinking the rest of it;
+    // the receiver is told via `SkipEntry` and both sides report at the end.
+    let skipped: Arc<Mutex<std::collections::BTreeMap<u32, String>>> = Arc::default();
+
     let mut workers: JoinSet<Result<()>> = JoinSet::new();
     for _ in 0..opts.streams.max(1) {
         let conn = session.conn.clone();
@@ -320,6 +345,9 @@ async fn send_inner(
         let corrupt_target = opts.corrupt_chunk_once;
         let source_base = source_base.clone();
         let chunk_size = manifest.chunk_size;
+        let skipped = Arc::clone(&skipped);
+        let control_send = Arc::clone(&control_send);
+        let events = events.clone();
 
         workers.spawn(async move {
             let mut stream = conn.open_uni().await?;
@@ -332,17 +360,73 @@ async fn send_inner(
                 let job = { job_rx.lock().await.recv().await };
                 let Some(job) = job else { break };
 
+                // Every initial job must be accounted for, sent or skipped, or the
+                // `Complete` gate never fires.
+                let count_job = |job: &ChunkJob| {
+                    if !job.is_resend
+                        && sent_initial.fetch_add(1, Ordering::AcqRel) + 1 == initial_total
+                    {
+                        all_queued_sent.notify_one();
+                    }
+                };
+
+                if skipped.lock().await.contains_key(&job.entry_index) {
+                    count_job(&job);
+                    continue;
+                }
+
                 let entry = &manifest.entries[job.entry_index as usize];
                 let range = chunk_range(job.chunk_index as u64, chunk_size, entry.size)?;
                 let len = (range.end - range.start) as usize;
 
-                if open_file.as_ref().map(|(i, _)| *i) != Some(job.entry_index) {
-                    let f = tokio::fs::File::open(staged_path(&source_base, &entry.path)).await?;
-                    open_file = Some((job.entry_index, f));
+                // Local read failures are entry-local: skip the entry, keep the
+                // transfer. Stream and protocol errors below stay fatal.
+                let read = async {
+                    if open_file.as_ref().map(|(i, _)| *i) != Some(job.entry_index) {
+                        let f =
+                            tokio::fs::File::open(staged_path(&source_base, &entry.path)).await?;
+                        open_file = Some((job.entry_index, f));
+                    }
+                    let (_, file) = open_file.as_mut().expect("just set");
+                    file.seek(std::io::SeekFrom::Start(range.start)).await?;
+                    file.read_exact(&mut buf[..len]).await?;
+                    std::io::Result::Ok(())
                 }
-                let (_, file) = open_file.as_mut().expect("just set");
-                file.seek(std::io::SeekFrom::Start(range.start)).await?;
-                file.read_exact(&mut buf[..len]).await?;
+                .await;
+                if let Err(e) = read {
+                    open_file = None;
+                    let reason = e.to_string();
+                    let first_skip = skipped
+                        .lock()
+                        .await
+                        .insert(job.entry_index, reason.clone())
+                        .is_none();
+                    if first_skip {
+                        {
+                            let mut send = control_send.lock().await;
+                            wire::write_frame(
+                                &mut send,
+                                &ControlMessage::SkipEntry {
+                                    transfer_id,
+                                    entry_index: job.entry_index,
+                                    reason: reason.clone(),
+                                },
+                            )
+                            .await?;
+                        }
+                        emit(
+                            &events,
+                            TransferEvent::EntrySkipped {
+                                transfer_id,
+                                path: entry.path.clone(),
+                                reason,
+                            },
+                        )
+                        .await;
+                    }
+                    count_job(&job);
+                    continue;
+                }
 
                 if corrupt_target == Some((job.entry_index, job.chunk_index))
                     && corruption_pending.swap(false, Ordering::AcqRel)
@@ -481,6 +565,9 @@ struct RecvShared {
     bytes_done: AtomicU64,
     /// Pinged when `remaining` hits zero so the main loop re-checks completion.
     made_progress: Notify,
+    /// Entries the sender announced it cannot read (`SkipEntry`), by index. These
+    /// are excluded from verification and removed from the delivered tree.
+    skipped: Mutex<std::collections::BTreeMap<u32, String>>,
     control_send: Arc<Mutex<quinn::SendStream>>,
     events: mpsc::Sender<TransferEvent>,
 }
@@ -693,6 +780,7 @@ async fn receive_inner(
         remaining: AtomicU64::new(missing),
         bytes_done: AtomicU64::new(bytes_already),
         made_progress: Notify::new(),
+        skipped: Mutex::default(),
         control_send: Arc::clone(&session.control_send),
         events: events.clone(),
     });
@@ -718,7 +806,9 @@ async fn receive_inner(
                 events,
                 TransferEvent::Progress {
                     transfer_id,
-                    bytes_done: manifest.total_bytes,
+                    // Actual verified bytes: with skipped entries the total is
+                    // deliberately never reached.
+                    bytes_done: shared.bytes_done.load(Ordering::Acquire),
                     total_bytes: manifest.total_bytes,
                 },
             )
@@ -901,6 +991,11 @@ async fn drive_receive(
                 Some(Ok(ControlMessage::Complete { transfer_id: tid })) if tid == transfer_id => {
                     complete_received = true;
                 }
+                Some(Ok(ControlMessage::SkipEntry { transfer_id: tid, entry_index, reason }))
+                    if tid == transfer_id =>
+                {
+                    handle_skip(shared, entry_index, reason, events).await?;
+                }
                 Some(Ok(ControlMessage::Cancel { reason, .. })) => {
                     break Err(Error::TransferFailed {
                         reason: format!("cancelled by sender: {reason}"),
@@ -954,6 +1049,55 @@ async fn drive_receive(
         .await;
     }
     result
+}
+
+/// A `SkipEntry` from the sender: stop expecting the entry's outstanding chunks.
+/// If the entry is already fully staged (a resume), the data wins and the skip is
+/// ignored.
+async fn handle_skip(
+    shared: &Arc<RecvShared>,
+    entry_index: u32,
+    reason: String,
+    events: &mpsc::Sender<TransferEvent>,
+) -> Result<()> {
+    let entry = shared
+        .manifest
+        .entries
+        .get(entry_index as usize)
+        .ok_or_else(|| Error::Protocol("SkipEntry entry_index out of range".into()))?;
+    let offset = shared.offsets[entry_index as usize] as usize;
+    let n = entry.chunk_hashes.len();
+
+    let mut newly_absent = 0u64;
+    {
+        let mut bitmap = shared.bitmap.lock().await;
+        if bitmap[offset..offset + n].iter().all(|b| *b) {
+            return Ok(());
+        }
+        for b in &mut bitmap[offset..offset + n] {
+            if !*b {
+                *b = true;
+                newly_absent += 1;
+            }
+        }
+    }
+    shared
+        .skipped
+        .lock()
+        .await
+        .insert(entry_index, reason.clone());
+    shared.remaining.fetch_sub(newly_absent, Ordering::AcqRel);
+    shared.made_progress.notify_one();
+    emit(
+        events,
+        TransferEvent::EntrySkipped {
+            transfer_id: shared.transfer_id,
+            path: entry.path.clone(),
+            reason,
+        },
+    )
+    .await;
+    Ok(())
 }
 
 /// Read chunk frames off one unidirectional stream until the sender finishes it.
@@ -1053,17 +1197,35 @@ async fn finalize(shared: &Arc<RecvShared>, staging: &Path, dest_dir: &Path) -> 
     let tree = shared.tree_base.clone();
     let manifest = Arc::clone(&shared.manifest);
     let dest_dir = dest_dir.to_owned();
+    let skipped: std::collections::BTreeSet<u32> =
+        shared.skipped.lock().await.keys().copied().collect();
 
     tokio::task::spawn_blocking(move || -> Result<PathBuf> {
         use std::io::Read;
 
+        let file_count = manifest
+            .entries
+            .iter()
+            .filter(|e| e.kind == EntryKind::File)
+            .count();
+        if file_count > 0 && skipped.len() >= file_count {
+            return Err(Error::TransferFailed {
+                reason: "every file in the transfer failed to read on the sender".into(),
+            });
+        }
+
         // Stream every staged file through BLAKE3; catches reassembly/offset bugs.
         let mut buf = vec![0u8; 1024 * 1024];
-        for entry in &manifest.entries {
+        for (entry_index, entry) in manifest.entries.iter().enumerate() {
             if entry.kind != EntryKind::File {
                 continue;
             }
             let path = staged_path(&tree, &entry.path);
+            // A skipped entry's partial must not land in the delivered tree.
+            if skipped.contains(&(entry_index as u32)) {
+                let _ = std::fs::remove_file(&path);
+                continue;
+            }
             let mut file = std::fs::File::open(&path)?;
             let mut hasher = crate::chunk::FileHasher::new();
             loop {

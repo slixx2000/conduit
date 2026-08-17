@@ -216,6 +216,14 @@ Resolved:
   discovery preference, and the UI's Connection panel (with manual override), not the socket bind;
   revisit if interface-scoped binding is ever needed for isolation.
 
+- **Per-entry skip (`SkipEntry`) is an appended enum variant, no `PROTOCOL_VERSION` bump.** A
+  sender that cannot read one entry mid-transfer drops that entry instead of failing the whole
+  payload (PROTOCOL.md §3.2). The variant sits at the end of `ControlMessage`, so every earlier
+  variant keeps its postcard index and normal transfers stay wire-compatible with older builds;
+  only a transfer that actually skips against an old peer fails to decode — which fails that
+  transfer, exactly what the old behavior did anyway. Bump `PROTOCOL_VERSION` for the next change
+  that alters existing frames rather than appending.
+
 - **Mount write semantics: buffered-then-flush** (both backends). A file created in the mount
   spools to a local temp file and is handed to the transfer engine when its last handle closes
   (WinFsp `cleanup`, FUSE `release`) — the chunked pipeline keeps its per-chunk verification and
