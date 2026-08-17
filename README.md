@@ -69,8 +69,8 @@ NSIS one — pick whichever your tooling prefers). SmartScreen will warn: **More
 Run anyway**. Silent installs:
 
 ```powershell
-msiexec /i Conduit_1.1.1_x64_en-US.msi /qn      # .msi
-.\Conduit_1.1.1_x64-setup.exe /S                # NSIS
+msiexec /i Conduit_1.1.2_x64_en-US.msi /qn      # .msi
+.\Conduit_1.1.2_x64-setup.exe /S                # NSIS
 ```
 
 *Mount as drive* additionally needs [WinFsp](https://winfsp.dev):
@@ -79,7 +79,7 @@ msiexec /i Conduit_1.1.1_x64_en-US.msi /qn      # .msi
 ### Linux — `.deb` (Debian, Ubuntu, Mint)
 
 ```bash
-sudo apt install ./Conduit_1.1.1_amd64.deb     # resolves dependencies; dpkg -i does not
+sudo apt install ./Conduit_1.1.2_amd64.deb     # resolves dependencies; dpkg -i does not
 conduit-app                                     # or launch it from your app menu
 ```
 
@@ -90,8 +90,8 @@ conduit-app                                     # or launch it from your app men
 ### Linux — AppImage (any distro)
 
 ```bash
-chmod +x Conduit_1.1.1_amd64.AppImage
-./Conduit_1.1.1_amd64.AppImage
+chmod +x Conduit_1.1.2_amd64.AppImage
+./Conduit_1.1.2_amd64.AppImage
 ```
 
 No installation and nothing to uninstall — delete the file. Two FUSE caveats, and
@@ -100,7 +100,7 @@ they are different things:
 - The AppImage *format* needs libfuse2 to self-mount. Ubuntu 22.04+/Mint 21+ ship
   only libfuse3, so if it fails with `dlopen(): error loading libfuse.so.2`, either
   `sudo apt install libfuse2t64` (older releases: `libfuse2`) or skip it entirely
-  with `./Conduit_1.1.1_amd64.AppImage --appimage-extract-and-run`.
+  with `./Conduit_1.1.2_amd64.AppImage --appimage-extract-and-run`.
 - Conduit's own *Mount as drive* needs `fuse3`, which the AppImage cannot install
   for you: `sudo apt install fuse3`.
 
@@ -202,8 +202,8 @@ cargo run --release -p conduit-cli -- bench --to <addr> --size-gib 1 --streams 2
 and uploads them to a **draft** GitHub release. Cut one by pushing a version tag:
 
 ```bash
-git tag v1.1.1
-git push origin v1.1.1
+git tag v1.1.2
+git push origin v1.1.2
 ```
 
 Then review the draft release on GitHub and publish it. (The Actions tab also has a

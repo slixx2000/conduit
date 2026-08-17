@@ -1,7 +1,7 @@
 {
   "name": "conduit",
   "private": true,
-  "version": "1.1.1",
+  "version": "1.1.2",
   "type": "module",
   "description": "Conduit desktop app: React/TS/Tailwind frontend in ui/, Rust core in crates/.",
   "scripts": {
