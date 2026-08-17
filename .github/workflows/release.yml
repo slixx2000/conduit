@@ -168,7 +168,9 @@ jobs:
             -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Conduit CI"
           TAG="${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}"
           APK="Conduit_${TAG#v}_universal.apk"
-          cp src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk "$APK"
+          # Gradle appends "-unsigned" when no signing config is present (the CI
+          # case); locally the same build emits the bare name. Accept either.
+          cp src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release*.apk "$APK"
           "$BUILD_TOOLS/apksigner" sign --ks ci.keystore --ks-pass pass:conduit-ci "$APK"
           echo "APK=$APK" >> "$GITHUB_ENV"
 
