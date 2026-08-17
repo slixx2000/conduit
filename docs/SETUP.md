@@ -45,7 +45,8 @@ Any of these works — Conduit picks the fastest automatically and shows it in t
   is waiting for approval.
 - **Ethernet cable straight between the two laptops** — no router, no settings.
   Modern network ports handle this automatically (link-local addressing; no
-  crossover cable needed).
+  crossover cable needed). Linux: if the wired connection sticks at
+  "Connecting…", see Troubleshooting.
 - **USB laptop-to-laptop bridge cable** (CDC-NCM type).
 - **Same WiFi network** — the always-works fallback, just slower.
 
@@ -87,6 +88,7 @@ and a file copied into a *subfolder* of the drive arrives in the peer's inbox ro
 | Symptom | Fix |
 |---|---|
 | Peer doesn't appear | Both apps running? Same network or cable connected? Some networks block mDNS — use "Connect by address" with the ip:port from the other machine's header. |
+| Direct Ethernet cable: Linux stuck at "Connecting…" | NetworkManager is waiting for DHCP that a direct cable doesn't have. Switch the wired profile to link-local once: `nmcli con mod "<connection name>" ipv4.method link-local ipv6.method link-local && nmcli con up "<connection name>"` (find the name with `nmcli con show`). Windows/macOS self-assign automatically after ~30 s. |
 | "waiting for authorization" banner | Approve the Thunderbolt device in your OS (Linux: `boltctl authorize`, or the desktop prompt). |
 | Mount button fails with "WinFsp is required" | Install WinFsp from winfsp.dev and retry. |
 | Mount button fails with "FUSE is required" (Linux) | `sudo apt install fuse3` (or your distribution's equivalent) and retry. |

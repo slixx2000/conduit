@@ -71,6 +71,18 @@ pub fn sysfs_is_thunderbolt_netdev(sysfs_root: &Path, interface: &str) -> bool {
     }
 }
 
+/// Whether `/sys/class/net/<interface>` (under `sysfs_root`) is backed by real
+/// hardware: physical NICs expose a `device` entry; veth/bridge/bond/dummy don't,
+/// yet still report ethernet `type == 1` and can look like a "direct cable"
+/// (carrier-up, link-local-only, no gateway).
+pub fn sysfs_is_physical_netdev(sysfs_root: &Path, interface: &str) -> bool {
+    sysfs_root
+        .join("class/net")
+        .join(interface)
+        .join("device")
+        .exists()
+}
+
 /// Thunderbolt devices that are present but not authorized (`authorized == 0`).
 /// Returns `(device_node_name, human_name)` pairs; `human_name` falls back to the
 /// node name when the device exposes none.
@@ -197,6 +209,18 @@ mod tests {
             assert!(!sysfs_is_thunderbolt_netdev(fake.root(), "eth0"));
         }
         assert!(!sysfs_is_thunderbolt_netdev(fake.root(), "missing0"));
+    }
+
+    #[test]
+    fn virtual_netdevs_are_not_physical() {
+        let fake = FakeSysfs::new();
+        fake.add_netdev("eth0", "pci");
+        // veths and bridges have a class/net entry but no device/ underneath.
+        std::fs::create_dir_all(fake.root().join("class/net/veth0")).unwrap();
+
+        assert!(sysfs_is_physical_netdev(fake.root(), "eth0"));
+        assert!(!sysfs_is_physical_netdev(fake.root(), "veth0"));
+        assert!(!sysfs_is_physical_netdev(fake.root(), "missing0"));
     }
 
     #[test]

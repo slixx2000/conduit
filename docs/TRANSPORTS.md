@@ -112,6 +112,14 @@ this transport — they share the same host-to-host mode; only `speed_tier` diff
 Enumerate up, non-loopback **wired** interfaces (Linux: `/sys/class/net/*` where `type`/driver is
 Ethernet and `carrier == 1`; exclude the Thunderbolt netdev, which the TB transport already owns).
 
+**Exclude virtual netdevs** (Linux: no `/sys/class/net/<if>/device` entry — veth, bridge, bond,
+dummy). Found the hard way during the first real direct-Ethernet run: Docker's `veth*` pairs report
+ethernet `type == 1`, carrier-up, an `fe80::` address, and no gateway — a perfect match for the
+direct-cable rule below — so two container veths outranked the actual cable as the preferred link
+(fake `~10 Gbps` "direct cable" entries in `doctor`). Physical NICs always have a `device` entry in
+sysfs; virtual ones never do, so that one check filters all of them
+(`sysfs_is_physical_netdev`, fixture-tested in `conduit-net`).
+
 Classify **direct vs LAN**:
 - A wired interface that is carrier-up but has **no default gateway / no DHCP lease**, using only a
   **link-local** address, is treated as a **direct** laptop-to-laptop cable → `direct = true`.

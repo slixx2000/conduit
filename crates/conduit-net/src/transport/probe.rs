@@ -180,6 +180,8 @@ fn platform_interfaces() -> anyhow::Result<Vec<RawIface>> {
         let read = |file: &str| std::fs::read_to_string(class.join(file)).ok();
         let hint = if class.join("wireless").exists() || class.join("phy80211").exists() {
             KindHint::Wireless
+        } else if !crate::sysfs_is_physical_netdev(sysfs, &name) {
+            KindHint::Excluded // veth/bridge/bond: virtual, never the data path
         } else if read("type").map(|t| t.trim() == "1").unwrap_or(false) {
             KindHint::Wired
         } else {
