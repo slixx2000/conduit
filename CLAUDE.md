@@ -96,9 +96,17 @@ the staged state. CLI: `peers [--watch]`, `send --peer <name>`. **Deferred from 
 shared-folder browsing + inbox-per-peer (not in the phase's acceptance criteria; shares its
 machinery with Phase 4's `ListDir`/`ReadRange`, so build it there).
 
-CI runs on a Linux + Windows matrix (currently disabled on GitHub: private repo without Actions
-billing). `.github/workflows/release.yml` builds unsigned installers for all three platforms into a
-draft GitHub release, triggered by pushing a `v*` tag.
+CI runs on a Linux + Windows matrix. `.github/workflows/release.yml` builds unsigned installers for
+all three platforms into a draft GitHub release, triggered by pushing a `v*` tag (verified working:
+v1.0.0).
+
+**Direct-Ethernet acceptance (partial, 2026-08-17):** over a real CAT6 cable between this machine
+and a Windows laptop, the link classified as `Direct Ethernet · direct cable`, ranked preferred, and
+mDNS discovered the peer at its `169.254.x.x` address. Two findings along the way: Linux
+NetworkManager sticks at "Connecting…" until the wired profile is set to link-local (documented in
+`docs/SETUP.md` troubleshooting), and Docker `veth*` interfaces matched the direct-cable rule and
+outranked the real cable — fixed by excluding netdevs without a sysfs `device` entry (see
+`docs/TRANSPORTS.md` §3.2). Throughput bench over the cable still to run (needs interactive pairing).
 
 Two things that will bite you if you don't know them:
 
