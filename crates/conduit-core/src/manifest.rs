@@ -196,7 +196,20 @@ fn valid_entry_path(root: &str, path: &str) -> bool {
 ///
 /// Runs on the blocking pool: it is a CPU/disk bound pass over potentially many
 /// gigabytes.
-pub async fn manifest_for_path(path: &Path, chunk_size: u32) -> Result<Manifest> {
+/// A source file left out of a manifest because it could not be read (locked,
+/// permissions, vanished mid-walk). Reported alongside the manifest so callers can
+/// surface it; the transfer proceeds without these files.
+#[derive(Debug, Clone)]
+pub struct SkippedSource {
+    /// Root-prefixed `/`-separated path, like manifest entry paths.
+    pub path: String,
+    pub reason: String,
+}
+
+pub async fn manifest_for_path(
+    path: &Path,
+    chunk_size: u32,
+) -> Result<(Manifest, Vec<SkippedSource>)> {
     assert!(chunk_size > 0, "chunk size must be non-zero");
     let path = path.to_owned();
     tokio::task::spawn_blocking(move || manifest_for_path_sync(&path, chunk_size))
@@ -204,7 +217,7 @@ pub async fn manifest_for_path(path: &Path, chunk_size: u32) -> Result<Manifest>
         .map_err(|e| Error::Protocol(format!("manifest task panicked: {e}")))?
 }
 
-fn manifest_for_path_sync(path: &Path, chunk_size: u32) -> Result<Manifest> {
+fn manifest_for_path_sync(path: &Path, chunk_size: u32) -> Result<(Manifest, Vec<SkippedSource>)> {
     let root_name = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -218,12 +231,32 @@ fn manifest_for_path_sync(path: &Path, chunk_size: u32) -> Result<Manifest> {
 
     let meta = std::fs::metadata(path)?;
     let mut entries = Vec::new();
+    let mut skipped = Vec::new();
     let mut total = 0u64;
 
     if meta.is_dir() {
         entries.push(dir_entry(root_name.clone()));
-        walk_dir(path, &root_name, chunk_size, &mut entries, &mut total)?;
+        walk_dir(
+            path,
+            &root_name,
+            chunk_size,
+            &mut entries,
+            &mut skipped,
+            &mut total,
+        );
+        // Real folders always contain the root dir entry; if not one file survived
+        // the walk and something was skipped, there is nothing worth offering.
+        if !skipped.is_empty() && !entries.iter().any(|e| e.kind == EntryKind::File) {
+            return Err(Error::TransferFailed {
+                reason: format!(
+                    "no readable files in {root_name} — {} unreadable (first: {})",
+                    skipped.len(),
+                    skipped[0].reason
+                ),
+            });
+        }
     } else if meta.is_file() {
+        // A single-file send with an unreadable file has nothing to offer: hard error.
         entries.push(file_entry(path, root_name.clone(), chunk_size, &mut total)?);
     } else {
         return Err(Error::Io(std::io::Error::new(
@@ -240,19 +273,36 @@ fn manifest_for_path_sync(path: &Path, chunk_size: u32) -> Result<Manifest> {
         entries,
     };
     manifest.transfer_id = manifest.derived_transfer_id();
-    Ok(manifest)
+    Ok((manifest, skipped))
 }
 
+/// Walk one directory level. Unreadable files and subdirectories are recorded in
+/// `skipped` rather than aborting the walk — one locked file must not veto a whole
+/// tree (game folders and AV locks make this routine, not exceptional).
 fn walk_dir(
     dir: &Path,
     rel_prefix: &str,
     chunk_size: u32,
     entries: &mut Vec<Entry>,
+    skipped: &mut Vec<SkippedSource>,
     total: &mut u64,
-) -> Result<()> {
-    let mut items: Vec<_> = std::fs::read_dir(dir)?.collect::<std::io::Result<_>>()?;
-    // Sort by name for a deterministic manifest (and therefore transfer id).
-    items.sort_by_key(|e| e.file_name());
+) {
+    let items = match std::fs::read_dir(dir)
+        .and_then(|it| it.collect::<std::io::Result<Vec<_>>>())
+    {
+        Ok(mut items) => {
+            // Sort by name for a deterministic manifest (and therefore transfer id).
+            items.sort_by_key(|e| e.file_name());
+            items
+        }
+        Err(e) => {
+            skipped.push(SkippedSource {
+                path: rel_prefix.to_owned(),
+                reason: e.to_string(),
+            });
+            return;
+        }
+    };
 
     for item in items {
         let name = match item.file_name().into_string() {
@@ -263,19 +313,33 @@ fn walk_dir(
             }
         };
         let rel = format!("{rel_prefix}/{name}");
-        let file_type = item.file_type()?;
+        let file_type = match item.file_type() {
+            Ok(t) => t,
+            Err(e) => {
+                skipped.push(SkippedSource {
+                    path: rel,
+                    reason: e.to_string(),
+                });
+                continue;
+            }
+        };
         if file_type.is_symlink() {
             tracing::warn!("skipping symlink {rel}: not supported yet");
             continue;
         }
         if file_type.is_dir() {
             entries.push(dir_entry(rel.clone()));
-            walk_dir(&item.path(), &rel, chunk_size, entries, total)?;
+            walk_dir(&item.path(), &rel, chunk_size, entries, skipped, total);
         } else if file_type.is_file() {
-            entries.push(file_entry(&item.path(), rel, chunk_size, total)?);
+            match file_entry(&item.path(), rel.clone(), chunk_size, total) {
+                Ok(entry) => entries.push(entry),
+                Err(e) => skipped.push(SkippedSource {
+                    path: rel,
+                    reason: e.to_string(),
+                }),
+            }
         }
     }
-    Ok(())
 }
 
 fn dir_entry(path: String) -> Entry {
@@ -358,7 +422,7 @@ mod tests {
         let data: Vec<u8> = (0..10_000u32).map(|i| (i % 251) as u8).collect();
         let (_dir, path) = write_temp(&data);
 
-        let m = manifest_for_path(&path, 4096).await.unwrap();
+        let m = manifest_for_path(&path, 4096).await.unwrap().0;
         m.validate().unwrap();
         assert_eq!(m.total_bytes, 10_000);
         assert_eq!(m.root_name, "payload.bin");
@@ -382,7 +446,7 @@ mod tests {
         std::fs::write(root.join("2024/b.jpg"), b"bbbbbb").unwrap();
         std::fs::write(root.join("2024/c.jpg"), b"").unwrap();
 
-        let m = manifest_for_path(&root, 4096).await.unwrap();
+        let m = manifest_for_path(&root, 4096).await.unwrap().0;
         m.validate().unwrap();
         assert_eq!(m.root_name, "photos");
         assert_eq!(m.total_bytes, 10);
@@ -410,11 +474,11 @@ mod tests {
         assert_eq!(c.file_hash, *blake3::hash(b"").as_bytes());
 
         // Rebuilding the same tree gives the same transfer id (deterministic resume key).
-        let again = manifest_for_path(&root, 4096).await.unwrap();
+        let again = manifest_for_path(&root, 4096).await.unwrap().0;
         assert_eq!(m.transfer_id, again.transfer_id);
         // A content change gives a different id.
         std::fs::write(root.join("a.jpg"), b"AAAA").unwrap();
-        let changed = manifest_for_path(&root, 4096).await.unwrap();
+        let changed = manifest_for_path(&root, 4096).await.unwrap().0;
         assert_ne!(m.transfer_id, changed.transfer_id);
     }
 
@@ -426,7 +490,7 @@ mod tests {
         std::fs::write(root.join("one.bin"), vec![1u8; 5000]).unwrap();
         std::fs::write(root.join("two.bin"), vec![2u8; 9000]).unwrap();
 
-        let m = manifest_for_path(&root, 4096).await.unwrap();
+        let m = manifest_for_path(&root, 4096).await.unwrap().0;
         // Entries: dir(data)=0 chunks, one.bin=2 chunks, two.bin=3 chunks.
         assert_eq!(m.chunk_index_offsets(), vec![0, 0, 2]);
         assert_eq!(m.total_chunks(), 5);

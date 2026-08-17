@@ -494,6 +494,14 @@ async fn mount_peer(
             let peer_id = peer_id.clone();
             rt.spawn(async move {
                 let state = app.state::<AppState>();
+                // Same per-target gate as send_to_peer: a folder copied onto the
+                // drive closes files one after another, and each close ships —
+                // without this every ship dials its own racing QUIC connection.
+                let queue = {
+                    let mut queues = state.send_queues.lock().await;
+                    Arc::clone(queues.entry(peer_id.clone()).or_default())
+                };
+                let _turn = queue.lock().await;
                 let result: Result<(), String> = async {
                     let candidates = resolve_target(&state, &peer_id).await?;
                     let session = state
@@ -682,7 +690,28 @@ async fn send_to_peer(
                 };
                 let manifest =
                     match conduit_core::manifest_for_path(Path::new(&path), chunk_size).await {
-                        Ok(m) => Some(Arc::new(m)),
+                        Ok((m, build_skips)) => {
+                            let m = Arc::new(m);
+                            // Show the card immediately: queueing and dialing are
+                            // otherwise invisible, which read as "nothing happened".
+                            let _ = events
+                                .send(conduit_core::TransferEvent::Started {
+                                    transfer_id: m.transfer_id,
+                                    name: m.root_name.clone(),
+                                    total_bytes: m.total_bytes,
+                                })
+                                .await;
+                            for s in &build_skips {
+                                let _ = events
+                                    .send(conduit_core::TransferEvent::EntrySkipped {
+                                        transfer_id: m.transfer_id,
+                                        path: s.path.clone(),
+                                        reason: s.reason.clone(),
+                                    })
+                                    .await;
+                            }
+                            Some(m)
+                        }
                         Err(e) => {
                             outcome = Err(format!("could not read {prep_name}: {e}"));
                             None
@@ -769,6 +798,16 @@ async fn send_to_peer(
                 match &outcome {
                     Ok(()) => notify(&app, "Transfer complete", &format!("Sent {name} to {peer_name}")).await,
                     Err(e) => {
+                        // Resolve the card too: a connect that never reached the
+                        // engine produced no Failed event of its own.
+                        if let Some(m) = manifest.as_ref() {
+                            let _ = events
+                                .send(conduit_core::TransferEvent::Failed {
+                                    transfer_id: m.transfer_id,
+                                    reason: e.clone(),
+                                })
+                                .await;
+                        }
                         emit_error(&app, format!("send failed: {e}"));
                         notify(&app, "Transfer failed", &format!("{name}: {e}")).await;
                     }

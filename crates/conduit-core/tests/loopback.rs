@@ -525,7 +525,7 @@ async fn unreadable_entry_is_skipped_not_fatal() {
         rand::thread_rng().fill_bytes(&mut data);
         std::fs::write(root.join(name), &data).unwrap();
     }
-    let manifest = Arc::new(manifest_for_path(&root, 64 * 1024).await.unwrap());
+    let manifest = Arc::new(manifest_for_path(&root, 64 * 1024).await.unwrap().0);
     std::fs::remove_file(root.join("b.bin")).unwrap();
 
     let alice = make_peer("Alice");
@@ -572,7 +572,7 @@ async fn unreadable_entry_is_skipped_not_fatal() {
 async fn transfer_with_every_entry_unreadable_fails() {
     let src_dir = tempfile::tempdir().unwrap();
     let source = random_file(src_dir.path(), 128 * 1024);
-    let manifest = Arc::new(manifest_for_path(&source, 64 * 1024).await.unwrap());
+    let manifest = Arc::new(manifest_for_path(&source, 64 * 1024).await.unwrap().0);
     std::fs::remove_file(&source).unwrap();
 
     let alice = make_peer("Alice");
@@ -591,4 +591,32 @@ async fn transfer_with_every_entry_unreadable_fails() {
     let sent = send_manifest(session, manifest, &source, SendOptions::default(), send_tx).await;
     assert!(sent.is_err(), "an all-skipped transfer must fail");
     assert!(receiver.await.unwrap().is_err());
+}
+
+/// A file that is unreadable when the manifest is *built* (permissions, AV lock)
+/// is left out of the offer entirely — previously it aborted the whole send
+/// before anything was offered.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn unreadable_source_file_is_excluded_at_manifest_build() {
+    use std::os::unix::fs::PermissionsExt;
+    let src_dir = tempfile::tempdir().unwrap();
+    let root = src_dir.path().join("bundle");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("ok.bin"), b"readable").unwrap();
+    std::fs::write(root.join("locked.bin"), b"secret").unwrap();
+    std::fs::set_permissions(root.join("locked.bin"), std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let (manifest, skipped) = manifest_for_path(&root, 4096).await.unwrap();
+    assert_eq!(skipped.len(), 1, "one skip expected: {skipped:?}");
+    assert_eq!(skipped[0].path, "bundle/locked.bin");
+    assert!(manifest.entries.iter().all(|e| e.path != "bundle/locked.bin"));
+    assert!(manifest.entries.iter().any(|e| e.path == "bundle/ok.bin"));
+
+    // Restore so the tempdir can be cleaned up.
+    std::fs::set_permissions(
+        root.join("locked.bin"),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
 }

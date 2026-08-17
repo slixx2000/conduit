@@ -183,7 +183,21 @@ pub async fn send_path(
     opts: SendOptions,
     events: mpsc::Sender<TransferEvent>,
 ) -> Result<()> {
-    let manifest = Arc::new(manifest_for_path(path, opts.chunk_size).await?);
+    let (manifest, build_skips) = manifest_for_path(path, opts.chunk_size).await?;
+    let manifest = Arc::new(manifest);
+    // Files that were unreadable while hashing never made the manifest; surface
+    // them through the same event the mid-transfer skip path uses.
+    for s in &build_skips {
+        emit(
+            &events,
+            TransferEvent::EntrySkipped {
+                transfer_id: manifest.transfer_id,
+                path: s.path.clone(),
+                reason: s.reason.clone(),
+            },
+        )
+        .await;
+    }
     send_manifest(session, manifest, path, opts, events).await
 }
 
