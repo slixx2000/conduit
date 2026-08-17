@@ -19,6 +19,13 @@
   --color-slate-600: #524b4c;
 }
 
+/* The app is dark on every platform. Without this, WebView2 (Windows) and WebKit
+   (macOS) draw native scrollbars, checkboxes and form controls in the OS light
+   style on top of the black UI. */
+html {
+  color-scheme: dark;
+}
+
 html,
 body,
 #root {

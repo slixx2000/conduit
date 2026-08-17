@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- Brand mark: two peers joined by the conduit. Palette: black / white / #df2531.
+       Regenerate all sizes with: npm run tauri icon src-tauri/icons/source.svg -->
+  <rect width="1024" height="1024" rx="224" fill="#000000"/>
+  <rect x="240" y="464" width="240" height="96" rx="48" fill="#f5f3f3"/>
+  <rect x="544" y="464" width="240" height="96" rx="48" fill="#df2531"/>
+</svg>
