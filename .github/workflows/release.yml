@@ -1,7 +1,7 @@
 name: Release
 
-# Builds installers for all three desktop platforms and uploads them to a GitHub
-# release. Runs on a version tag (`git tag v0.1.0 && git push --tags`), or manually
+# Builds installers for all three desktop platforms plus an Android APK and
+# uploads them to a GitHub release. Runs on a version tag (`git tag v0.1.0 && git push --tags`), or manually
 # via the Actions tab for a test build.
 #
 # Builds are UNSIGNED for now. Users see a one-time OS prompt (Windows SmartScreen,
@@ -122,3 +122,58 @@ jobs:
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}
+
+  # Android APK, uploaded into the same draft release the desktop jobs create.
+  # ponytail: signed with a keystore generated in the run — installable, but the
+  # signing identity changes every release, so upgrading means uninstall-first.
+  # For a stable identity, add ANDROID_KEYSTORE_B64 + ANDROID_KEYSTORE_PASSWORD
+  # secrets and replace the keytool step with a base64 decode.
+  android:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: android
+
+      - name: Build APK
+        run: |
+          export NDK_HOME="$ANDROID_NDK_LATEST_HOME"
+          npm run build
+          npm run tauri android build
+
+      - name: Sign APK
+        run: |
+          BUILD_TOOLS="$ANDROID_HOME/build-tools/$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)"
+          keytool -genkeypair -keystore ci.keystore -storepass conduit-ci -alias ci \
+            -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Conduit CI"
+          TAG="${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}"
+          APK="Conduit_${TAG#v}_universal.apk"
+          cp src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk "$APK"
+          "$BUILD_TOOLS/apksigner" sign --ks ci.keystore --ks-pass pass:conduit-ci "$APK"
+          echo "APK=$APK" >> "$GITHUB_ENV"
+
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ github.ref_type == 'tag' && github.ref_name || inputs.tag }}" "$APK"
